@@ -159,6 +159,7 @@ class HfimPkModelTest(unittest.TestCase):
                     dosing_mode="loading dose only",
                     loading_target_concentration_mg_l=18,
                     loading_duration_h=0.5,
+                    loading_volume_ml=5,
                 ),
             ],
             duration_h=1,
@@ -168,6 +169,8 @@ class HfimPkModelTest(unittest.TestCase):
         imipenem_rows = [row for row in result.rows if row["drug"] == "imipenem"]
         self.assertEqual(imipenem_rows[0]["central_mg_l"], 0)
         self.assertGreater(max(row["central_mg_l"] for row in imipenem_rows), 9)
+        self.assertAlmostEqual(result.summary["imipenem"]["loading_concentration_mg_ml"], 0.612)
+        self.assertAlmostEqual(result.summary["imipenem"]["loading_infusion_rate_ml_h"], 10)
 
     def test_no_dose_mode_does_not_add_loading_or_infusion(self):
         result = simulate_hfim(

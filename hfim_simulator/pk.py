@@ -51,6 +51,7 @@ class DrugConfig:
     dosing_mode: str = "loading dose + continuous infusion"
     loading_target_concentration_mg_l: float | None = None
     loading_duration_h: float = 0.0
+    loading_volume_ml: float = 5.0
     intermittent_interval_h: float = 6.0
     intermittent_duration_h: float = 1.0
 
@@ -63,9 +64,13 @@ class ContinuousInfusionRegimen:
     elimination_flow_ml_min: float
     loading_target_concentration_mg_l: float
     loading_duration_h: float
+    loading_volume_ml: float
     intermittent_interval_h: float
     intermittent_duration_h: float
     loading_dose_mg: float
+    loading_concentration_mg_ml: float
+    loading_infusion_rate_ml_h: float
+    loading_infusion_rate_ml_min: float
     intermittent_dose_mg: float
     infusion_rate_mg_h: float
     daily_amount_mg: float
@@ -102,6 +107,7 @@ def compute_continuous_infusion(
     central_volume_ml: float,
     loading_target_concentration_mg_l: float | None = None,
     loading_duration_h: float = 0.0,
+    loading_volume_ml: float = 5.0,
     intermittent_interval_h: float = 6.0,
     intermittent_duration_h: float = 1.0,
     shared_elimination_flow_ml_min: float | None = None,
@@ -118,6 +124,9 @@ def compute_continuous_infusion(
     infusion_rate_mg_min = target_mg_ml * elimination_flow_ml_min
     infusion_rate_mg_h = infusion_rate_mg_min * 60
     loading_dose_mg = loading_target_mg_ml * central_volume_ml
+    loading_concentration_mg_ml = loading_dose_mg / loading_volume_ml if loading_volume_ml > 0 else 0.0
+    loading_infusion_rate_ml_h = loading_volume_ml / loading_duration_h if loading_duration_h > 0 else 0.0
+    loading_infusion_rate_ml_min = loading_volume_ml / (loading_duration_h * 60) if loading_duration_h > 0 else 0.0
     intermittent_dose_mg = target_mg_ml * central_volume_ml
     return ContinuousInfusionRegimen(
         target_concentration_mg_l=target_concentration_mg_l,
@@ -126,9 +135,13 @@ def compute_continuous_infusion(
         elimination_flow_ml_min=elimination_flow_ml_min,
         loading_target_concentration_mg_l=loading_target,
         loading_duration_h=loading_duration_h,
+        loading_volume_ml=loading_volume_ml,
         intermittent_interval_h=intermittent_interval_h,
         intermittent_duration_h=intermittent_duration_h,
         loading_dose_mg=loading_dose_mg,
+        loading_concentration_mg_ml=loading_concentration_mg_ml,
+        loading_infusion_rate_ml_h=loading_infusion_rate_ml_h,
+        loading_infusion_rate_ml_min=loading_infusion_rate_ml_min,
         intermittent_dose_mg=intermittent_dose_mg,
         infusion_rate_mg_h=infusion_rate_mg_h,
         daily_amount_mg=infusion_rate_mg_h * 24,
@@ -175,6 +188,7 @@ def simulate_hfim(
             system.central_volume_ml,
             loading_target_concentration_mg_l=drug.loading_target_concentration_mg_l,
             loading_duration_h=drug.loading_duration_h,
+            loading_volume_ml=drug.loading_volume_ml,
             intermittent_interval_h=drug.intermittent_interval_h,
             intermittent_duration_h=drug.intermittent_duration_h,
             shared_elimination_flow_ml_min=system.q_waste_ml_min,
@@ -258,7 +272,11 @@ def simulate_hfim(
             "target_concentration_mg_l": regimen.target_concentration_mg_l,
             "loading_target_concentration_mg_l": regimen.loading_target_concentration_mg_l,
             "loading_duration_h": regimen.loading_duration_h,
+            "loading_volume_ml": regimen.loading_volume_ml,
             "loading_dose_mg": regimen.loading_dose_mg,
+            "loading_concentration_mg_ml": regimen.loading_concentration_mg_ml,
+            "loading_infusion_rate_ml_h": regimen.loading_infusion_rate_ml_h,
+            "loading_infusion_rate_ml_min": regimen.loading_infusion_rate_ml_min,
             "intermittent_dose_mg": regimen.intermittent_dose_mg,
             "intermittent_interval_h": regimen.intermittent_interval_h,
             "intermittent_duration_h": regimen.intermittent_duration_h,
@@ -618,7 +636,13 @@ def _preparation_table(
                 "component": "loading dose",
                 "amount_mg": regimen.loading_dose_mg,
                 "daily_amount_mg": None,
-                "note": f"target {regimen.loading_target_concentration_mg_l:g} mg/L over {regimen.loading_duration_h:g} h",
+                "note": (
+                    f"target {regimen.loading_target_concentration_mg_l:g} mg/L; "
+                    f"dissolve in {regimen.loading_volume_ml:g} mL "
+                    f"({regimen.loading_concentration_mg_ml:g} mg/mL); "
+                    f"infuse over {regimen.loading_duration_h:g} h "
+                    f"at {regimen.loading_infusion_rate_ml_h:g} mL/h"
+                ),
             })
         if dosing_mode in {"loading dose + continuous infusion", "continuous infusion only"}:
             diluent_note = "amount is mg/h; maintenance CI is mixed into the central diluent reservoir"

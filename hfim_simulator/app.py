@@ -284,6 +284,7 @@ def main() -> None:
                 dosing_mode=values["dosing_mode"],
                 loading_target_concentration_mg_l=values["loading_target_concentration_mg_l"],
                 loading_duration_h=values["loading_duration_h"],
+                loading_volume_ml=values["loading_volume_ml"],
                 intermittent_interval_h=values["dosing_frequency_h"] or 6.0,
                 intermittent_duration_h=values["maintenance_duration_h"],
             ))
@@ -538,7 +539,7 @@ def _drug_input_panel(st, active_drug_count: int) -> dict[str, dict]:
             loading_target = 0.0
             loading_duration_h = 0.0
             maintenance_duration_h = default["maintenance_duration_h"]
-            detail_cols = st.columns(3)
+            detail_cols = st.columns(4)
             if loading_dose:
                 loading_target = detail_cols[0].number_input(
                     "Loading target (mg/L)",
@@ -554,8 +555,18 @@ def _drug_input_panel(st, active_drug_count: int) -> dict[str, dict]:
                     step=0.25,
                     key=f"loading_duration_{index}",
                 )
+                loading_volume_ml = detail_cols[2].number_input(
+                    "Loading dose volume (mL)",
+                    min_value=0.01,
+                    value=default["loading_volume_ml"],
+                    step=0.5,
+                    help="Volume used to dissolve the loading dose. This determines stock concentration and pump rate, not the target mg dose.",
+                    key=f"loading_volume_{index}",
+                )
+            else:
+                loading_volume_ml = default["loading_volume_ml"]
             if maintenance == "intermittent infusion":
-                maintenance_duration_h = detail_cols[2].number_input(
+                maintenance_duration_h = detail_cols[3].number_input(
                     "Maintenance infusion duration (h)",
                     min_value=0.01,
                     value=default["maintenance_duration_h"],
@@ -573,6 +584,7 @@ def _drug_input_panel(st, active_drug_count: int) -> dict[str, dict]:
                 "dosing_frequency_h": dosing_frequency_h,
                 "loading_target_concentration_mg_l": loading_target if loading_dose else None,
                 "loading_duration_h": loading_duration_h,
+                "loading_volume_ml": loading_volume_ml,
                 "maintenance_duration_h": maintenance_duration_h,
             }
     return selected
@@ -679,6 +691,7 @@ def _drug_default(index: int) -> dict:
             "dosing_frequency_h": 6.0,
             "loading_target_multiplier": 1.0,
             "loading_duration_h": 0.0,
+            "loading_volume_ml": 5.0,
             "maintenance_duration_h": 1.0,
         },
         {
@@ -691,6 +704,7 @@ def _drug_default(index: int) -> dict:
             "dosing_frequency_h": 0.0,
             "loading_target_multiplier": 2.0,
             "loading_duration_h": 0.5,
+            "loading_volume_ml": 5.0,
             "maintenance_duration_h": 1.0,
         },
         {
@@ -703,6 +717,7 @@ def _drug_default(index: int) -> dict:
             "dosing_frequency_h": 0.0,
             "loading_target_multiplier": 2.0,
             "loading_duration_h": 0.5,
+            "loading_volume_ml": 5.0,
             "maintenance_duration_h": 1.0,
         },
     ]
@@ -718,6 +733,7 @@ def _drug_default(index: int) -> dict:
         "dosing_frequency_h": 0.0,
         "loading_target_multiplier": 2.0,
         "loading_duration_h": 0.5,
+        "loading_volume_ml": 5.0,
         "maintenance_duration_h": 1.0,
     }
 
@@ -826,15 +842,20 @@ def _injection_plan_rows(drug_inputs: dict[str, dict], fos: FosfomycinConfig, sc
                     "Physical setting": f"{fos.extra_stock_mg_ml:g} mg/mL in full extra volume",
                 })
         else:
+            loading_text = "loading dose: no; "
+            if values["loading_dose"]:
+                loading_volume_ml = values.get("loading_volume_ml", 0.0)
+                loading_rate_ml_h = loading_volume_ml / values["loading_duration_h"] if values["loading_duration_h"] else 0.0
+                loading_text = (
+                    f"loading target: {values['loading_target_concentration_mg_l']:g} mg/L; "
+                    f"{loading_volume_ml:g} mL over {values['loading_duration_h']:g} h "
+                    f"({loading_rate_ml_h:g} mL/h); "
+                )
             rows.append({
                 "Drug": name,
                 "Target": f"{values['target_type']} = {values['target_value']:g}",
                 "Half-life": f"{values['half_life_h']:g} h",
-                "Dosing plan": (
-                    f"loading target: {values['loading_target_concentration_mg_l']:g} mg/L over {values['loading_duration_h']:g} h; "
-                    if values["loading_dose"]
-                    else "loading dose: no; "
-                ) + f"maintenance: {values['maintenance']}",
+                "Dosing plan": loading_text + f"maintenance: {values['maintenance']}",
                 "Physical setting": "calculated from loading/Css target and the shared central-to-waste flow",
             })
     return rows
@@ -915,12 +936,23 @@ def _schematic_injection_values(
         if not values or not item:
             continue
         if values["loading_dose"]:
-            loading_rate_mg_h = item["loading_dose_mg"] / item["loading_duration_h"] if item["loading_duration_h"] else 0.0
+            loading_volume_ml = item.get("loading_volume_ml", values.get("loading_volume_ml", 0.0))
+            loading_concentration = item.get(
+                "loading_concentration_mg_ml",
+                item["loading_dose_mg"] / loading_volume_ml if loading_volume_ml else 0.0,
+            )
+            loading_rate_ml_h = item.get(
+                "loading_infusion_rate_ml_h",
+                loading_volume_ml / item["loading_duration_h"] if item["loading_duration_h"] else 0.0,
+            )
             central_other_lines.append(
                 f"{name} LD direct: target {values['loading_target_concentration_mg_l']:.1f} mg/L"
             )
             central_other_lines.append(
-                f"weigh {item['loading_dose_mg']:.3f} mg over {item['loading_duration_h']:.2f} h ({loading_rate_mg_h:.2f} mg/h)"
+                f"weigh {item['loading_dose_mg']:.3f} mg in {loading_volume_ml:g} mL"
+            )
+            central_other_lines.append(
+                f"stock {loading_concentration:.4f} mg/mL; {loading_rate_ml_h:.2f} mL/h"
             )
         if values["maintenance"] == "continuous infusion":
             concentration = item.get("central_diluent_concentration_mg_ml")
@@ -1010,9 +1042,11 @@ def _plot_setup_schematic(system_values: dict[str, str], injection_values: dict[
 
     def semantic_text_color(line: str) -> str:
         text = line.lower()
+        if "mg/dose" in text or "mg/q24h" in text or "weigh" in text or "ld " in text or "ci " in text or "replacement" in text:
+            return colors["amber"]
         if "ug/ml" in text or "mg/ml" in text or "stock" in text or "concentration" in text:
             return colors["blue"]
-        if "ml/min" in text or "mg/" in text or " mg" in text or "ld " in text or "ci " in text or "replacement" in text:
+        if "ml/min" in text or "ml/h" in text or " mg" in text:
             return colors["amber"]
         if "ml" in text or "prepare" in text or "+10%" in text or "volume" in text:
             return colors["green"]
@@ -1210,17 +1244,17 @@ def _plot_setup_schematic(system_values: dict[str, str], injection_values: dict[
     other_title = " / ".join(injection_values.get("central_other_drugs", [])) or "Other central dosing"
     protocol_row(
         right_x,
-        6.25,
+        6.12,
         col_w,
-        1.62,
+        1.75,
         other_title,
         injection_values["central_other"],
         accent=colors["blue"],
         facecolor="#eef2ff",
         wrap_width=62,
-        max_lines=5,
-        body_fontsize=5.7,
-        line_step=0.135,
+        max_lines=8,
+        body_fontsize=5.45,
+        line_step=0.12,
     )
     central_diluent_lines = injection_values.get("central_diluent", []) or ["No continuous-infusion drugs mixed"]
     protocol_row(
@@ -1232,9 +1266,9 @@ def _plot_setup_schematic(system_values: dict[str, str], injection_values: dict[
         central_diluent_lines,
         accent=colors["teal"],
         facecolor=colors["teal_fill"],
-        wrap_width=36,
+        wrap_width=48,
         max_lines=7,
-        body_fontsize=5.9,
+        body_fontsize=5.75,
         line_step=0.13,
     )
     extra_title = _extra_schematic_title(setup_drug, scenario)
@@ -1433,6 +1467,31 @@ def _preparation_review_rows(
                 "Amount to weigh": f"{amount_mg * 1.10:.3f} mg/q{interval_h:g}h",
                 "Volume": f"{extra_summary['prepared_volume_per_interval_ml'] * 1.10:.1f} mL q{interval_h:g}h",
                 "Note": "prepare the extra fill; Qextra transfer is not a second prepared solution",
+            })
+        elif row["Component"] == "loading dose":
+            loading_amount_mg = drug_summary.get("loading_dose_mg")
+            loading_volume_ml = drug_summary.get("loading_volume_ml")
+            loading_concentration = drug_summary.get("loading_concentration_mg_ml")
+            loading_rate_ml_h = drug_summary.get("loading_infusion_rate_ml_h")
+            loading_rate_ml_min = drug_summary.get("loading_infusion_rate_ml_min")
+            rows.append({
+                "Drug": row["Drug"],
+                "Add into": destination,
+                "Dosing part": row["Component"],
+                "Frequency": "loading dose",
+                "Concentration": (
+                    f"{loading_concentration:.6f} mg/mL ({loading_concentration * 1000:.3f} ug/mL)"
+                    if loading_concentration is not None else ""
+                ),
+                "Required amount": f"{loading_amount_mg:.3f} mg" if loading_amount_mg is not None else row["Amount"],
+                "10% extra": "not included",
+                "Amount to weigh": f"{loading_amount_mg:.3f} mg" if loading_amount_mg is not None else row["Amount"],
+                "Volume": f"{loading_volume_ml:g} mL" if loading_volume_ml is not None else _volume_from_note(row["Note"]),
+                "Note": (
+                    f"direct into central; infuse over {drug_summary.get('loading_duration_h', 0):g} h "
+                    f"at {loading_rate_ml_h:.2f} mL/h ({loading_rate_ml_min:.3f} mL/min)"
+                    if loading_rate_ml_h is not None and loading_rate_ml_min is not None else row["Note"]
+                ),
             })
         else:
             rows.append({

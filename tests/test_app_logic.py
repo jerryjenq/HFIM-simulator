@@ -181,12 +181,24 @@ class HfimAppLogicTest(unittest.TestCase):
         summary = {
             "imipenem": {
                 "target_concentration_mg_l": 9,
+                "loading_dose_mg": 3.06,
+                "loading_volume_ml": 5.0,
+                "loading_duration_h": 0.5,
+                "loading_concentration_mg_ml": 0.612,
+                "loading_infusion_rate_ml_h": 10.0,
+                "loading_infusion_rate_ml_min": 0.1666666667,
                 "central_diluent_concentration_mg_ml": 0.01007,
                 "central_diluent_volume_per_24h_ml": 2022.0,
                 "central_diluent_drug_per_24h_mg": 20.362,
             },
             "relebactam": {
                 "target_concentration_mg_l": 6,
+                "loading_dose_mg": 2.04,
+                "loading_volume_ml": 5.0,
+                "loading_duration_h": 0.5,
+                "loading_concentration_mg_ml": 0.408,
+                "loading_infusion_rate_ml_h": 10.0,
+                "loading_infusion_rate_ml_min": 0.1666666667,
                 "central_diluent_concentration_mg_ml": 0.006713,
                 "central_diluent_volume_per_24h_ml": 2022.0,
                 "central_diluent_drug_per_24h_mg": 13.575,
@@ -223,12 +235,24 @@ class HfimAppLogicTest(unittest.TestCase):
         summary = {
             "imipenem": {
                 "target_concentration_mg_l": 9,
+                "loading_dose_mg": 3.06,
+                "loading_volume_ml": 5.0,
+                "loading_duration_h": 0.5,
+                "loading_concentration_mg_ml": 0.612,
+                "loading_infusion_rate_ml_h": 10.0,
+                "loading_infusion_rate_ml_min": 0.1666666667,
                 "central_diluent_concentration_mg_ml": 0.01007,
                 "central_diluent_volume_per_24h_ml": 2022.0,
                 "central_diluent_drug_per_24h_mg": 20.362,
             },
             "relebactam": {
                 "target_concentration_mg_l": 6,
+                "loading_dose_mg": 2.04,
+                "loading_volume_ml": 5.0,
+                "loading_duration_h": 0.5,
+                "loading_concentration_mg_ml": 0.408,
+                "loading_infusion_rate_ml_h": 10.0,
+                "loading_infusion_rate_ml_min": 0.1666666667,
                 "central_diluent_concentration_mg_ml": 0.006713,
                 "central_diluent_volume_per_24h_ml": 2022.0,
                 "central_diluent_drug_per_24h_mg": 13.575,
@@ -255,6 +279,11 @@ class HfimAppLogicTest(unittest.TestCase):
         self.assertEqual(extra_row["Drug"], "fosfomycin")
         self.assertEqual(extra_row["Concentration"], "0.305929 mg/mL")
         self.assertEqual(extra_row["Amount to weigh"], "81.102 mg/q24h")
+
+        imipenem_ld = [row for row in rows if row["Drug"] == "imipenem" and row["Dosing part"] == "loading dose"][0]
+        self.assertEqual(imipenem_ld["Concentration"], "0.612000 mg/mL (612.000 ug/mL)")
+        self.assertEqual(imipenem_ld["Volume"], "5 mL")
+        self.assertIn("10.00 mL/h", imipenem_ld["Note"])
 
     def test_presentation_schematic_exports_editable_svg_text(self):
         system_values = {
