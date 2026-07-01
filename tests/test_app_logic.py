@@ -4,6 +4,8 @@ from hfim_simulator.app import (
     _central_diluent_default_for_flow_mode,
     _central_diluent_reservoir_rows,
     _central_diluent_reservoir_summary,
+    _figure_export_bytes,
+    _plot_setup_schematic,
     _preparation_destination_cards,
     _preparation_review_rows,
     _shared_central_half_life_from_widget_state,
@@ -253,6 +255,36 @@ class HfimAppLogicTest(unittest.TestCase):
         self.assertEqual(extra_row["Drug"], "fosfomycin")
         self.assertEqual(extra_row["Concentration"], "0.305929 mg/mL")
         self.assertEqual(extra_row["Amount to weigh"], "81.102 mg/q24h")
+
+    def test_presentation_schematic_exports_editable_svg_text(self):
+        system_values = {
+            "Central": "100 mL",
+            "Cartridge": "70 mL",
+            "Extra": "241 mL",
+            "Extra to central": "0.167 mL/min",
+            "Extra diluent": "0 mL/min",
+            "Central diluent": "1.404 mL/min",
+            "Waste": "1.571 mL/min",
+            "Extra overflow": "0 mL/min while dosing",
+            "Reservoir interval": "q24h",
+        }
+        injection_values = {
+            "setup_central": ["central q6h infusion", "stock 5.4088 mg/mL", "6 mL over 1 h", "32.45 mg/dose"],
+            "central_other": ["imipenem LD 3.060 mg/0.50 h", "imipenem CI in Diluent Central"],
+            "central_other_drugs": ["imipenem", "relebactam"],
+            "central_diluent": ["prepare 2022 mL/q24h", "+10% = 2224 mL", "imipenem: 10.07 ug/mL, 20.36 mg"],
+            "extra": ["full compartment replacement", "stock 0.966477 mg/mL", "232.92 mg/replacement", "replace q24h"],
+            "setup_drug": "fosfomycin",
+        }
+
+        fig = _plot_setup_schematic(system_values, injection_values, "q24_replacement")
+        svg = _figure_export_bytes(fig, "svg")
+        png = _figure_export_bytes(fig, "png")
+
+        self.assertIn(b"<svg", svg[:200])
+        self.assertIn(b"HFIM system overview", svg)
+        self.assertIn(b"Protocol recipe", svg)
+        self.assertGreater(len(png), 100_000)
 
 
 if __name__ == "__main__":

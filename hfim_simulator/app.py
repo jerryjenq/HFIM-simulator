@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from html import escape
+from io import BytesIO
 import math
 from pathlib import Path
+import textwrap
 
 from .agent import ask_setup_agent, build_agent_context
 from .pk import DrugConfig, FosfomycinConfig, SystemConfig, flow_for_half_life, half_life_for_flow, simulate_hfim, solve_css_cmax_replacement
@@ -287,7 +289,7 @@ def main() -> None:
             ))
     result = simulate_hfim(scenario, system, fos, drugs, duration_h=duration_h, dt_min=dt_min)
 
-    st.pyplot(_plot_setup_schematic(system_values={
+    setup_schematic_fig = _plot_setup_schematic(system_values={
         "Central": f"{central_bottle_ml:g} mL",
         "Cartridge": f"{cartridge_ml:g} mL",
         "Extra": f"{extra_volume_ml:g} mL",
@@ -297,7 +299,27 @@ def main() -> None:
         "Waste": f"{q_extra_to_central + q_central_diluent:g} mL/min",
         "Extra overflow": f"{fos.extra_infusion_ml_min:g} mL/min while dosing",
         "Reservoir interval": f"q{reservoir_replacement_interval_h:g}h",
-    }, injection_values=_schematic_injection_values(drug_inputs, fos, scenario, result.summary), scenario=scenario))
+    }, injection_values=_schematic_injection_values(drug_inputs, fos, scenario, result.summary), scenario=scenario)
+    st.image(_figure_export_bytes(setup_schematic_fig, "png", dpi=300), width="stretch")
+    export_cols = st.columns([1, 1, 1, 5])
+    export_cols[0].download_button(
+        "SVG",
+        data=_figure_export_bytes(setup_schematic_fig, "svg"),
+        file_name="hfim-setup-schematic.svg",
+        mime="image/svg+xml",
+    )
+    export_cols[1].download_button(
+        "PDF",
+        data=_figure_export_bytes(setup_schematic_fig, "pdf"),
+        file_name="hfim-setup-schematic.pdf",
+        mime="application/pdf",
+    )
+    export_cols[2].download_button(
+        "PNG",
+        data=_figure_export_bytes(setup_schematic_fig, "png"),
+        file_name="hfim-setup-schematic.png",
+        mime="image/png",
+    )
     st.dataframe(_setup_overview_rows(central_bottle_ml, cartridge_ml, extra_volume_ml, q_extra_to_central, q_extra_diluent, q_central_diluent, scenario, fos), width="stretch", hide_index=True)
     st.markdown("**System solution volumes**")
     st.dataframe(_solution_volume_rows(q_central_diluent, q_extra_diluent, scenario, duration_h), width="stretch", hide_index=True)
@@ -839,26 +861,50 @@ def _schematic_injection_values(
     central_other_lines = []
     central_diluent_lines = []
     extra_lines = []
+    central_diluent_volume_ml = 0.0
+    ci_items = [
+        item
+        for name, item in summary.items()
+        if name != "drug_preparation"
+        and isinstance(item, dict)
+        and item.get("central_diluent_concentration_mg_ml") is not None
+    ]
+    if ci_items:
+        central_diluent_volume_ml = max(item.get("central_diluent_volume_per_24h_ml", 0.0) for item in ci_items)
+        central_diluent_lines.append(f"reservoir volume {central_diluent_volume_ml:.0f} mL/q24h")
+        central_diluent_lines.append(f"prepare +10% {central_diluent_volume_ml * 1.10:.0f} mL")
     if setup_drug_name in drug_inputs:
+        dose_interval_h = fos.dosing_interval_min / 60
+        central_dose_volume_ml = fos.central_infusion_ml_min * fos.infusion_duration_min
+        central_daily_amount_mg = fos.central_dose_mg * 24 / dose_interval_h
+        central_daily_volume_ml = central_dose_volume_ml * 24 / dose_interval_h
         setup_central_lines.extend([
-            f"{setup_drug_name} central",
+            f"q{dose_interval_h:g}h direct central infusion",
             f"stock {fos.central_stock_mg_ml:g} mg/mL",
-            f"{fos.central_infusion_ml_min * fos.infusion_duration_min:g} mL over {fos.infusion_duration_min / 60:g} h",
-            f"q{fos.dosing_interval_min / 60:g}h = {fos.central_dose_mg:.2f} mg/dose",
+            f"dose volume {central_dose_volume_ml:g} mL over {fos.infusion_duration_min / 60:g} h",
+            f"{fos.central_dose_mg:.2f} mg/dose",
+            f"24h prep {central_daily_volume_ml:.1f} mL; {central_daily_amount_mg:.2f} mg",
         ])
         if scenario == "overflow":
+            extra_dose_volume_ml = fos.extra_infusion_ml_min * fos.infusion_duration_min
+            extra_daily_amount_mg = fos.extra_dose_mg * 24 / dose_interval_h
+            extra_daily_volume_ml = extra_dose_volume_ml * 24 / dose_interval_h
             extra_lines.extend([
-                f"{setup_drug_name} extra",
+                f"q{dose_interval_h:g}h extra infusion",
                 f"stock {fos.extra_stock_mg_ml:g} mg/mL",
-                f"{fos.extra_infusion_ml_min * fos.infusion_duration_min:g} mL over {fos.infusion_duration_min / 60:g} h",
-                f"q{fos.dosing_interval_min / 60:g}h = {fos.extra_dose_mg:.2f} mg/dose",
+                f"dose volume {extra_dose_volume_ml:g} mL over {fos.infusion_duration_min / 60:g} h",
+                f"{fos.extra_dose_mg:.2f} mg/dose",
+                f"24h prep {extra_daily_volume_ml:.1f} mL; {extra_daily_amount_mg:.2f} mg",
             ])
         elif scenario == "q24_replacement":
+            replacement_volume_ml = summary[setup_drug_name]["final_extra_volume_ml"]
+            replacement_amount_mg = fos.extra_stock_mg_ml * replacement_volume_ml
             extra_lines.extend([
-                f"{setup_drug_name} q24h replacement",
+                f"full extra replacement q{fos.reservoir_replacement_interval_h:g}h",
                 f"stock {fos.extra_stock_mg_ml:g} mg/mL",
-                f"{fos.extra_stock_mg_ml * summary[setup_drug_name]['final_extra_volume_ml']:.2f} mg/replacement",
-                f"replace q{fos.reservoir_replacement_interval_h:g}h",
+                f"fill volume {replacement_volume_ml:.0f} mL",
+                f"weigh {replacement_amount_mg:.2f} mg/replacement",
+                f"+10%: {replacement_volume_ml * 1.10:.1f} mL; {replacement_amount_mg * 1.10:.2f} mg",
             ])
 
     for name in drug_inputs:
@@ -868,21 +914,25 @@ def _schematic_injection_values(
         item = summary.get(name)
         if not values or not item:
             continue
-        central_other_lines.append(f"{name} central")
         if values["loading_dose"]:
-            central_other_lines.append(f"LD target {item['loading_target_concentration_mg_l']:.1f} mg/L")
-            central_other_lines.append(f"{item['loading_dose_mg']:.3f} mg over {item['loading_duration_h']:.2f} h")
+            loading_rate_mg_h = item["loading_dose_mg"] / item["loading_duration_h"] if item["loading_duration_h"] else 0.0
+            central_other_lines.append(
+                f"{name} LD direct: target {values['loading_target_concentration_mg_l']:.1f} mg/L"
+            )
+            central_other_lines.append(
+                f"weigh {item['loading_dose_mg']:.3f} mg over {item['loading_duration_h']:.2f} h ({loading_rate_mg_h:.2f} mg/h)"
+            )
         if values["maintenance"] == "continuous infusion":
-            central_other_lines.append("CI in Diluent Central")
             concentration = item.get("central_diluent_concentration_mg_ml")
             if concentration is not None:
-                central_diluent_lines.append(f"{name} {concentration * 1000:.2f} ug/mL")
-                central_diluent_lines.append(f"{item['central_diluent_drug_per_24h_mg']:.2f} mg/q24h")
+                weigh_mg = item["central_diluent_drug_per_24h_mg"] * 1.10
+                central_diluent_lines.append(f"{name}: {concentration * 1000:.2f} ug/mL; weigh {weigh_mg:.2f} mg")
             else:
+                central_other_lines.append(f"{name} CI in Diluent Central")
                 central_diluent_lines.append(f"{name} needs separate CI")
         if values["maintenance"] == "intermittent infusion":
             central_other_lines.append(
-                f"q{item['intermittent_interval_h']:.1f}h {item['intermittent_dose_mg']:.3f} mg/{item['intermittent_duration_h']:.2f}h"
+                f"{name} q{item['intermittent_interval_h']:.1f}h {item['intermittent_dose_mg']:.3f} mg/{item['intermittent_duration_h']:.2f}h"
             )
     if not setup_central_lines:
         setup_central_lines = [f"No {setup_drug_name} central dosing"]
@@ -901,87 +951,326 @@ def _schematic_injection_values(
 
 
 def _plot_setup_schematic(system_values: dict[str, str], injection_values: dict[str, list[str]], scenario: str):
+    import matplotlib as mpl
     import matplotlib.pyplot as plt
-    from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
+    from matplotlib.patches import Circle, FancyArrowPatch, FancyBboxPatch, Rectangle
 
-    fig, ax = plt.subplots(figsize=(12.0, 7.2))
-    ax.set_xlim(0, 11.2)
-    ax.set_ylim(-0.35, 7.2)
+    mpl.rcParams["svg.fonttype"] = "none"
+    mpl.rcParams["pdf.fonttype"] = 42
+    mpl.rcParams["ps.fonttype"] = 42
+    mpl.rcParams["font.family"] = "DejaVu Sans"
+
+    fig, ax = plt.subplots(figsize=(12.8, 7.2), dpi=180)
+    ax.set_xlim(0, 16)
+    ax.set_ylim(0, 9)
     ax.axis("off")
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
 
-    def box(x, y, w, h, title, value, facecolor="#e6f3ff", title_size=12, value_size=None):
-        patch = FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.08", linewidth=1.6, edgecolor="#2b6cb0", facecolor="#e6f3ff")
-        patch.set_facecolor(facecolor)
+    colors = {
+        "ink": "#172033",
+        "muted": "#5a6678",
+        "line": "#40516a",
+        "blue": "#315fbd",
+        "teal": "#117c73",
+        "amber": "#b8650b",
+        "green": "#087a5b",
+        "panel": "#f7f9fc",
+        "panel_edge": "#d7dee8",
+        "blue_fill": "#f3f7ff",
+        "teal_fill": "#f1fbf9",
+        "amber_fill": "#fff9ed",
+        "vessel_fill": "#eaf7fb",
+        "vessel_edge": "#8db5c4",
+    }
+
+    def rounded_panel(x, y, w, h, facecolor="#f8fafc", edgecolor="#cbd5e1", linewidth=1.0, linestyle="solid"):
+        patch = FancyBboxPatch(
+            (x, y),
+            w,
+            h,
+            boxstyle="round,pad=0.05,rounding_size=0.05",
+            linewidth=linewidth,
+            edgecolor=edgecolor,
+            facecolor=facecolor,
+            linestyle=linestyle,
+        )
         ax.add_patch(patch)
-        title_y = y + h * (0.76 if "\n" in value else 0.62)
-        value_y = y + h * (0.38 if "\n" in value else 0.30)
-        ax.text(x + w / 2, title_y, title, ha="center", va="center", fontsize=title_size, weight="bold")
-        value_font_size = value_size if value_size is not None else (9.0 if "\n" in value else 11)
-        ax.text(x + w / 2, value_y, value, ha="center", va="center", fontsize=value_font_size, color="#0a7f35", linespacing=1.08)
+        return patch
 
-    def note_box(x, y, w, h, title, lines):
-        patch = FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.08", linewidth=1.5, edgecolor="#0f766e", facecolor="#ecfeff")
-        ax.add_patch(patch)
-        ax.text(x + 0.12, y + h - 0.22, title, ha="left", va="top", fontsize=10.2, weight="bold", color="#0f172a")
-        ax.text(x + 0.12, y + h - 0.55, "\n".join(lines), ha="left", va="top", fontsize=8.1, color="#0f172a", linespacing=1.18)
+    def wrapped_lines(lines, width=34, max_lines=6):
+        wrapped: list[str] = []
+        for line in lines:
+            line = str(line)
+            chunks = textwrap.wrap(line, width=width, break_long_words=False, break_on_hyphens=False) or [""]
+            wrapped.extend(chunks)
+        if len(wrapped) > max_lines:
+            wrapped = wrapped[: max_lines - 1] + ["..."]
+        return wrapped
 
-    def arrow(start, end, label):
-        ax.add_patch(FancyArrowPatch(start, end, arrowstyle="->", mutation_scale=18, linewidth=2, color="#f97316"))
-        ax.text((start[0] + end[0]) / 2, (start[1] + end[1]) / 2 + 0.2, label, ha="center", fontsize=10, color="#f97316")
+    def semantic_text_color(line: str) -> str:
+        text = line.lower()
+        if "ug/ml" in text or "mg/ml" in text or "stock" in text or "concentration" in text:
+            return colors["blue"]
+        if "ml/min" in text or "mg/" in text or " mg" in text or "ld " in text or "ci " in text or "replacement" in text:
+            return colors["amber"]
+        if "ml" in text or "prepare" in text or "+10%" in text or "volume" in text:
+            return colors["green"]
+        return colors["muted"]
+
+    def protocol_row(
+        x,
+        y,
+        w,
+        h,
+        title,
+        lines,
+        accent="#315fbd",
+        facecolor="#f3f7ff",
+        max_lines=5,
+        wrap_width=48,
+        title_fontsize=9.0,
+        body_fontsize=7.0,
+        line_step=0.19,
+    ):
+        ax.add_patch(Rectangle((x, y), w, h, facecolor=facecolor, edgecolor="#dbe4ef", linewidth=0.45))
+        ax.add_patch(Rectangle((x, y), 0.060, h, facecolor=accent, edgecolor=accent, linewidth=0))
+        ax.text(x + 0.20, y + h - 0.18, title, ha="left", va="top", fontsize=title_fontsize, weight="bold", color=colors["ink"])
+        body_lines = wrapped_lines(lines, width=wrap_width, max_lines=max_lines)
+        line_y = y + h - 0.48
+        for i, line in enumerate(body_lines):
+            ax.text(
+                x + 0.20,
+                line_y - i * line_step,
+                line,
+                ha="left",
+                va="top",
+                fontsize=body_fontsize,
+                color=semantic_text_color(line),
+                linespacing=1.0,
+            )
+
+    def color_key(x, y, w, h):
+        ax.add_patch(Rectangle((x, y), w, h, facecolor="#ffffff", edgecolor="#dbe4ef", linewidth=0.45))
+        ax.text(x + 0.20, y + h - 0.18, "Color key", ha="left", va="top", fontsize=8.6, weight="bold", color=colors["ink"])
+        items = [
+            ("Volume", colors["green"]),
+            ("Concentration", colors["blue"]),
+            ("Dose / rate", colors["amber"]),
+            ("Route / note", colors["muted"]),
+        ]
+        x_positions = [x + 0.22, x + 1.92]
+        y_positions = [y + 0.40, y + 0.18]
+        for index, (label, color) in enumerate(items):
+            item_x = x_positions[index % 2]
+            item_y = y_positions[index // 2]
+            ax.add_patch(Rectangle((item_x, item_y), 0.15, 0.15, facecolor=color, edgecolor=color, linewidth=0))
+            ax.text(item_x + 0.23, item_y + 0.075, label, ha="left", va="center", fontsize=6.8, color=colors["muted"])
+
+    def arrow(start, end, label, color="#334155", label_offset=0.18, rad=0.0, label_color=None):
+        ax.add_patch(FancyArrowPatch(
+            start,
+            end,
+            arrowstyle="->",
+            mutation_scale=10,
+            linewidth=1.05,
+            color=color,
+            connectionstyle=f"arc3,rad={rad}",
+        ))
+        if label:
+            ax.text(
+                (start[0] + end[0]) / 2,
+                (start[1] + end[1]) / 2 + label_offset,
+                label,
+                ha="center",
+                va="center",
+                fontsize=7.6,
+                color=label_color or color,
+                bbox={"facecolor": "white", "edgecolor": "none", "pad": 1.2, "alpha": 0.9},
+            )
+
+    def vessel(x, y, w=0.46, h=0.92, fill_level=0.58):
+        body = FancyBboxPatch(
+            (x - w / 2, y - h / 2),
+            w,
+            h,
+            boxstyle="round,pad=0.0,rounding_size=0.11",
+            linewidth=0.8,
+            edgecolor=colors["vessel_edge"],
+            facecolor="#ffffff",
+            zorder=3,
+        )
+        ax.add_patch(body)
+        liquid_h = h * fill_level
+        ax.add_patch(Rectangle(
+            (x - w / 2 + 0.04, y - h / 2 + 0.04),
+            w - 0.08,
+            liquid_h,
+            facecolor=colors["vessel_fill"],
+            edgecolor="none",
+            alpha=0.9,
+            zorder=3.1,
+        ))
+        ax.add_patch(Rectangle((x - w * 0.23, y + h / 2 - 0.02), w * 0.46, 0.11, facecolor="#eef2f6", edgecolor=colors["vessel_edge"], linewidth=0.7, zorder=3.2))
+        ax.add_patch(Rectangle((x - w * 0.18, y + h / 2 + 0.09), w * 0.36, 0.10, facecolor="#f8fafc", edgecolor=colors["vessel_edge"], linewidth=0.7, zorder=3.2))
+        ax.plot([x - w * 0.15, x + w * 0.15], [y - h * 0.10, y - h * 0.13], color="#7fb6c8", linewidth=0.55, zorder=3.3)
+
+    def cartridge(x, y, w=2.10, h=0.34):
+        rounded_panel(x - w / 2, y - h / 2, w, h, facecolor="#f7fafc", edgecolor="#94a3b8", linewidth=0.75)
+        for side in (-1, 1):
+            ax.add_patch(Rectangle((x + side * w / 2 - side * 0.09 - (0.08 if side > 0 else 0), y - h * 0.62), 0.16, h * 1.24, facecolor="#eef2f6", edgecolor="#94a3b8", linewidth=0.65))
+            ax.add_patch(Circle((x + side * (w / 2 + 0.13), y), radius=0.13, facecolor="#eef2f6", edgecolor="#94a3b8", linewidth=0.65))
+        for i in range(8):
+            xi = x - w * 0.34 + i * w * 0.095
+            ax.plot([xi, xi + 0.16], [y - h * 0.22, y + h * 0.22], color="#c6d3df", linewidth=0.45, zorder=3.5)
+
+    def component_label(x, y, title, value, align="center", value_color=None):
+        ax.text(x, y, title, ha=align, va="top", fontsize=8.8, weight="bold", color=colors["ink"], zorder=6)
+        if value:
+            ax.text(x, y - 0.27, value, ha=align, va="top", fontsize=8.0, color=value_color or colors["green"], zorder=6)
 
     setup_drug = injection_values["setup_drug"]
-    box(1.0, 2.05, 1.8, 1.2, "Waste", system_values["Waste"])
-    box(4.0, 2.05, 2.0, 1.4, "Central", system_values["Central"])
-    box(4.1, 3.85, 1.8, 0.65, "Cartridge", system_values["Cartridge"])
-    box(7.1, 2.05, 1.8, 1.2, "Extra", system_values["Extra"])
-    if scenario == "overflow":
-        box(9.55, 2.1, 1.25, 1.05, "Extra waste", "overflow", facecolor="#fff7ed")
-    if scenario != "q24_replacement":
-        box(7.1, 0.35, 1.8, 0.9, "Diluent Extra", system_values["Extra diluent"])
-    central_diluent_lines = injection_values.get("central_diluent", [])
-    central_diluent_value = system_values["Central diluent"]
-    if central_diluent_lines:
-        central_diluent_value = "\n".join([system_values["Central diluent"], *central_diluent_lines[:4]])
-    central_diluent_h = 1.55 if central_diluent_lines else 0.9
-    central_diluent_y = 0.05 if central_diluent_lines else 0.35
-    central_diluent_w = 3.15 if central_diluent_lines else 2.3
-    central_diluent_x = 3.35 if central_diluent_lines else 3.85
-    box(
-        central_diluent_x,
-        central_diluent_y,
-        central_diluent_w,
-        central_diluent_h,
-        "Diluent Central q24h",
-        central_diluent_value,
-        title_size=11.5,
-        value_size=9.7 if central_diluent_lines else None,
-    )
-    note_box(0.35, 5.35, 2.85, 1.55, f"{setup_drug} to central", injection_values["setup_central"])
-    other_title = " / ".join(injection_values.get("central_other_drugs", [])) or "Other central dosing"
-    note_box(3.55, 5.35, 2.9, 1.55, other_title, injection_values["central_other"])
-    extra_title = _extra_schematic_title(setup_drug, scenario)
-    if scenario != "q24_replacement":
-        note_box(6.8, 5.35, 2.85, 1.55, extra_title, injection_values["extra"])
-    else:
-        note_box(6.8, 5.35, 2.85, 1.55, extra_title, injection_values["extra"])
 
-    arrow((7.1, 2.65), (6.0, 2.65), system_values["Extra to central"])
+    rounded_panel(0.45, 0.55, 7.35, 7.95, facecolor="#ffffff", edgecolor="#d4dde9", linewidth=0.75, linestyle=(0, (4, 4)))
+    rounded_panel(8.05, 2.60, 7.50, 5.90, facecolor=colors["panel"], edgecolor=colors["panel_edge"], linewidth=0.75)
+    ax.text(0.70, 8.15, "HFIM system overview", ha="left", va="top", fontsize=13.4, weight="bold", color=colors["ink"])
+    ax.text(8.38, 8.15, "Protocol recipe", ha="left", va="top", fontsize=13.4, weight="bold", color=colors["ink"])
+
+    cartridge(4.05, 6.35)
+    vessel(4.08, 4.08, w=0.50, h=0.98, fill_level=0.62)
+    vessel(1.28, 4.05, w=0.42, h=0.84, fill_level=0.18)
+    vessel(6.65, 4.08, w=0.44, h=0.86, fill_level=0.58)
+    vessel(3.15, 1.78, w=0.42, h=0.84, fill_level=0.45)
+
+    component_label(4.05, 7.05, "Hollow fiber cartridge", system_values["Cartridge"])
+    component_label(4.08, 3.22, "Central compartment", system_values["Central"])
+    component_label(1.28, 2.9, "Waste", system_values["Waste"], value_color=colors["amber"])
+    component_label(6.65, 2.92, "Extra compartment", system_values["Extra"])
+    component_label(3.15, 1.02, "Central diluent q24h", "")
+
     if scenario == "overflow":
-        arrow((8.9, 2.65), (9.55, 2.65), "overflow")
-    arrow((4.0, 2.65), (2.8, 2.65), system_values["Waste"])
-    arrow((5.0, central_diluent_y + central_diluent_h), (5.0, 2.05), system_values["Central diluent"])
+        vessel(7.42, 2.7, w=0.38, h=0.76, fill_level=0.12)
+        component_label(7.42, 1.82, "Extra overflow", system_values["Extra overflow"], value_color=colors["amber"])
     if scenario != "q24_replacement":
-        arrow((8.0, 1.25), (8.0, 2.05), system_values["Extra diluent"])
-    arrow((5.0, 3.45), (5.0, 3.85), "120 mL/min")
-    arrow((2.65, 5.35), (4.15, 3.42), "dose to central")
-    arrow((5.95, 5.35), (5.25, 3.45), "LD to central")
+        vessel(6.65, 1.6, w=0.42, h=0.84, fill_level=0.45)
+        component_label(6.65, 0.72, "Diluent Extra", system_values["Extra diluent"], value_color=colors["amber"])
+
+    arrow((6.08, 4.08), (4.72, 4.08), system_values["Extra to central"], color=colors["line"], label_color=colors["amber"])
+    arrow((3.48, 4.05), (1.92, 4.05), system_values["Waste"], color=colors["line"], label_color=colors["amber"])
+    central_diluent_drugs = [
+        line.split(":", 1)[0]
+        for line in injection_values.get("central_diluent", [])
+        if ":" in line and not line.startswith("+")
+    ]
+    if central_diluent_drugs:
+        ax.text(3.15, 0.76, " / ".join(central_diluent_drugs) + " CI", ha="center", va="top", fontsize=8.2, weight="bold", color=colors["teal"])
+    arrow((3.44, 2.22), (3.78, 3.46), "", color=colors["teal"], label_offset=0.02, rad=-0.08)
+    ax.text(
+        3.78,
+        2.42,
+        system_values["Central diluent"],
+        ha="left",
+        va="center",
+        fontsize=7.6,
+        color=colors["amber"],
+        bbox={"facecolor": "white", "edgecolor": "none", "pad": 1.0, "alpha": 0.92},
+    )
+    arrow((4.08, 4.7), (4.08, 5.78), "120 mL/min", color=colors["line"], label_color=colors["amber"])
+    arrow((4.48, 5.78), (4.48, 4.82), "", color=colors["line"])
+    ax.text(1.10, 7.42, f"{setup_drug} to central", ha="left", va="bottom", fontsize=8.8, weight="bold", color=colors["blue"])
+    ax.text(3.28, 7.42, " / ".join(injection_values.get("central_other_drugs", [])) or "Other central dosing", ha="left", va="bottom", fontsize=8.8, weight="bold", color=colors["blue"])
+    ax.text(5.95, 7.42, _extra_schematic_title(setup_drug, scenario), ha="left", va="bottom", fontsize=8.8, weight="bold", color=colors["amber"])
+    arrow((1.12, 7.22), (3.38, 4.78), "direct dose", color=colors["blue"], label_offset=0.0)
+    arrow((3.26, 7.22), (4.0, 4.86), "LD direct", color=colors["blue"], label_offset=0.0)
     if scenario != "q24_replacement":
-        extra_arrow_label = _extra_schematic_arrow_label(scenario)
-        arrow((8.1, 5.35), (8.1, 3.25), extra_arrow_label)
+        arrow((6.65, 2.08), (6.65, 3.34), "extra diluent", color=colors["teal"], label_offset=0.0)
+        if scenario == "overflow":
+            arrow((6.90, 4.08), (7.35, 3.05), "overflow", color=colors["amber"], label_offset=0.04)
     else:
-        arrow((8.1, 5.35), (8.1, 3.25), "q24h full replacement")
+        arrow((6.65, 7.18), (6.65, 4.82), "q24h replacement", color=colors["amber"], label_offset=0.0)
+
+    row_x = 8.32
+    col_gap = 0.22
+    col_w = 3.36
+    right_x = row_x + col_w + col_gap
+    row_w = col_w * 2 + col_gap
+    protocol_row(
+        row_x,
+        6.25,
+        col_w,
+        1.62,
+        f"{setup_drug}: central q6h",
+        injection_values["setup_central"],
+        accent=colors["blue"],
+        facecolor=colors["blue_fill"],
+        wrap_width=34,
+        body_fontsize=6.0,
+        line_step=0.13,
+    )
+    other_title = " / ".join(injection_values.get("central_other_drugs", [])) or "Other central dosing"
+    protocol_row(
+        right_x,
+        6.25,
+        col_w,
+        1.62,
+        other_title,
+        injection_values["central_other"],
+        accent=colors["blue"],
+        facecolor="#eef2ff",
+        wrap_width=62,
+        max_lines=5,
+        body_fontsize=5.7,
+        line_step=0.135,
+    )
+    central_diluent_lines = injection_values.get("central_diluent", []) or ["No continuous-infusion drugs mixed"]
+    protocol_row(
+        row_x,
+        4.38,
+        col_w,
+        1.62,
+        "Central diluent q24h",
+        central_diluent_lines,
+        accent=colors["teal"],
+        facecolor=colors["teal_fill"],
+        wrap_width=36,
+        max_lines=7,
+        body_fontsize=5.9,
+        line_step=0.13,
+    )
+    extra_title = _extra_schematic_title(setup_drug, scenario)
+    protocol_row(
+        right_x,
+        4.38,
+        col_w,
+        1.62,
+        extra_title,
+        injection_values["extra"],
+        accent=colors["amber"],
+        facecolor=colors["amber_fill"],
+        wrap_width=36,
+        max_lines=7,
+        body_fontsize=5.9,
+        line_step=0.13,
+    )
+    flow_lines = [
+        f"Central outflow: {system_values['Waste']}",
+        f"Qextra to central: {system_values['Extra to central']}",
+        f"Central diluent: {system_values['Central diluent']}",
+    ]
+    protocol_row(row_x, 2.92, col_w, 1.18, "System flow rates", flow_lines, accent=colors["line"], facecolor="#ffffff", max_lines=5, wrap_width=34, body_fontsize=5.9, line_step=0.13)
+    color_key(right_x, 2.92, col_w, 1.18)
+
     fig.tight_layout()
     return fig
+
+
+def _figure_export_bytes(fig, file_format: str, dpi: int = 300) -> bytes:
+    buffer = BytesIO()
+    save_kwargs = {"format": file_format, "bbox_inches": "tight", "facecolor": "white"}
+    if file_format == "png":
+        save_kwargs["dpi"] = dpi
+    fig.savefig(buffer, **save_kwargs)
+    return buffer.getvalue()
 
 
 def _extra_schematic_title(setup_drug: str, scenario: str) -> str:
