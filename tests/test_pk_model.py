@@ -31,8 +31,9 @@ class HfimPkModelTest(unittest.TestCase):
         self.assertAlmostEqual(regimen.infusion_rate_mg_h, 0.848, places=3)
         self.assertAlmostEqual(regimen.daily_amount_mg, 20.36, places=2)
 
-    def test_central_only_drugs_use_shared_physical_waste_flow(self):
+    def test_central_only_drugs_use_shared_physical_waste_flow_plus_setup_pump_average(self):
         shared_flow = flow_for_half_life(170, 1.25)
+        setup_pump_average_flow = 0.1 * 60 / 360
         result = simulate_hfim(
             scenario="q24_replacement",
             system=SystemConfig(
@@ -53,8 +54,9 @@ class HfimPkModelTest(unittest.TestCase):
             dt_min=1,
         )
 
-        self.assertAlmostEqual(result.summary["testdrug"]["infusion_rate_mg_h"], 0.848, places=3)
-        self.assertAlmostEqual(result.summary["testdrug"]["daily_amount_mg"], 20.36, places=2)
+        expected_rate_mg_h = (9 / 1000) * (shared_flow + setup_pump_average_flow) * 60
+        self.assertAlmostEqual(result.summary["testdrug"]["infusion_rate_mg_h"], expected_rate_mg_h)
+        self.assertAlmostEqual(result.summary["testdrug"]["daily_amount_mg"], expected_rate_mg_h * 24)
 
     def test_continuous_infusion_drug_is_formulated_in_central_diluent(self):
         shared_flow = flow_for_half_life(170, 1.25)
@@ -342,6 +344,250 @@ class HfimPkModelTest(unittest.TestCase):
         self.assertIn("Qextra transfer is modeled as drug leaving this same fill", extra_rows[0]["note"])
         self.assertNotIn("transfer demand", extra_rows[0]["note"])
         self.assertNotIn("minimum same-concentration solution", extra_rows[0]["note"])
+
+    def test_central_diluent_drug_washout_includes_setup_drug_pump_flow(self):
+        system = SystemConfig(
+            central_bottle_ml=100,
+            cartridge_ml=0,
+            extra_volume_ml=50,
+            q_extra_to_central_ml_min=0.0,
+            q_extra_diluent_ml_min=0.0,
+            q_central_diluent_ml_min=0.2,
+        )
+        fos = FosfomycinConfig(
+            drug_name="fosfomycin",
+            central_stock_mg_ml=0.0,
+            extra_stock_mg_ml=0.0,
+            central_infusion_ml_min=0.3,
+            extra_infusion_ml_min=0.0,
+            infusion_duration_min=60,
+            dosing_interval_min=360,
+        )
+        imipenem = DrugConfig(
+            "imipenem",
+            target_concentration_mg_l=0.0,
+            half_life_h=1.25,
+            dosing_mode="loading dose only",
+            loading_target_concentration_mg_l=10.0,
+            loading_duration_h=0.0,
+            loading_volume_ml=5.0,
+        )
+
+        result = simulate_hfim("overflow", system, fos, [imipenem], duration_h=1, dt_min=1)
+
+        imipenem_rows = [row for row in result.rows if row["drug"] == "imipenem"]
+        vc = system.central_volume_ml
+        initial_amount_mg = 10.0 / 1000 * vc
+        # Total central outflow during the fosfomycin dosing window = q_central_diluent (0.2) +
+        # q_fos_central (0.3) = 0.5 mL/min, not just q_central_diluent.
+        expected_amount_mg = initial_amount_mg * (1 - 0.5 / vc * 1)
+        expected_conc_mg_l = expected_amount_mg / vc * 1000
+
+        self.assertAlmostEqual(imipenem_rows[0]["central_mg_l"], 10.0)
+        self.assertAlmostEqual(imipenem_rows[1]["central_mg_l"], expected_conc_mg_l, places=6)
+
+    def test_continuous_infusion_recipe_uses_time_weighted_setup_drug_pump_flow(self):
+        system = SystemConfig(
+            central_bottle_ml=100,
+            cartridge_ml=0,
+            extra_volume_ml=50,
+            q_extra_to_central_ml_min=0.1,
+            q_extra_diluent_ml_min=0.0,
+            q_central_diluent_ml_min=0.2,
+        )
+        fos = FosfomycinConfig(
+            drug_name="fosfomycin",
+            central_stock_mg_ml=0.0,
+            extra_stock_mg_ml=0.0,
+            central_infusion_ml_min=0.6,
+            extra_infusion_ml_min=0.0,
+            infusion_duration_min=120,
+            dosing_interval_min=360,
+        )
+        imipenem = DrugConfig(
+            "imipenem",
+            target_concentration_mg_l=10.0,
+            half_life_h=1.25,
+            dosing_mode="continuous infusion only",
+        )
+
+        result = simulate_hfim("q24_replacement", system, fos, [imipenem], duration_h=24, dt_min=1)
+
+        average_setup_pump_ml_min = 0.6 * 120 / 360
+        effective_outflow_ml_min = system.q_waste_ml_min + average_setup_pump_ml_min
+        expected_rate_mg_h = (10.0 / 1000) * effective_outflow_ml_min * 60
+        imipenem_summary = result.summary["imipenem"]
+
+        self.assertAlmostEqual(imipenem_summary["elimination_flow_ml_min"], effective_outflow_ml_min)
+        self.assertAlmostEqual(imipenem_summary["infusion_rate_mg_h"], expected_rate_mg_h)
+        self.assertAlmostEqual(
+            imipenem_summary["central_diluent_concentration_mg_ml"],
+            (expected_rate_mg_h / 60) / system.q_central_diluent_ml_min,
+        )
+
+    def test_continuous_infusion_true_simulated_cavg_converges_to_target(self):
+        # Independent end-to-end check: run the full ODE (not the analytical recipe formula used to
+        # size the infusion rate) and confirm the CI drug's actual simulated concentration converges
+        # to its target Css, given that the setup drug's own pump flow perturbs the shared central
+        # outflow only during its dosing window. This is the check that would fail if the
+        # time-weighted effective outflow approximation were not actually representative of the real
+        # simulated dynamics - unlike a test that re-derives the same formula as the implementation.
+        system = SystemConfig(
+            central_bottle_ml=100, cartridge_ml=70, extra_volume_ml=241,
+            q_extra_to_central_ml_min=0.921, q_extra_diluent_ml_min=0.921, q_central_diluent_ml_min=0.65,
+        )
+        fos = FosfomycinConfig(
+            central_stock_mg_ml=5.9, extra_stock_mg_ml=8.35,
+            central_infusion_ml_min=0.1, extra_infusion_ml_min=0.1,
+            infusion_duration_min=60, dosing_interval_min=360,
+        )
+        imipenem = DrugConfig(
+            "imipenem",
+            target_concentration_mg_l=9.0,
+            half_life_h=1.25,
+            dosing_mode="loading dose + continuous infusion",
+            loading_target_concentration_mg_l=18.0,
+            loading_duration_h=0.5,
+        )
+
+        result = simulate_hfim("overflow", system, fos, [imipenem], duration_h=96, dt_min=1)
+        rows = [row for row in result.rows if row["drug"] == "imipenem"]
+        late_rows = [row for row in rows if row["time_h"] >= 72]
+        simulated_cavg = sum(row["central_mg_l"] for row in late_rows) / len(late_rows)
+
+        self.assertAlmostEqual(simulated_cavg, 9.0, delta=0.05)
+
+    def test_intermittent_maintenance_dose_matches_continuous_infusion_average_rate(self):
+        system = SystemConfig()
+        regimen = compute_continuous_infusion(
+            target_concentration_mg_l=9,
+            half_life_h=1.25,
+            central_volume_ml=system.central_volume_ml,
+            intermittent_interval_h=6,
+        )
+
+        self.assertAlmostEqual(
+            regimen.intermittent_dose_mg,
+            regimen.infusion_rate_mg_h * regimen.intermittent_interval_h,
+            places=9,
+        )
+
+    def test_intermittent_maintenance_converges_to_target_instead_of_drifting_with_interval(self):
+        result = simulate_hfim(
+            scenario="overflow",
+            system=SystemConfig(),
+            fos=FosfomycinConfig(central_stock_mg_ml=0, extra_stock_mg_ml=0),
+            drugs=[
+                DrugConfig(
+                    "testdrug",
+                    target_concentration_mg_l=9,
+                    half_life_h=1.25,
+                    dosing_mode="intermittent infusion only",
+                    intermittent_interval_h=6,
+                    intermittent_duration_h=1,
+                )
+            ],
+            duration_h=96,
+            dt_min=1,
+        )
+
+        rows = [row for row in result.rows if row["drug"] == "testdrug"]
+        late_rows = [row for row in rows if row["time_h"] >= 72]
+        late_avg_mg_l = sum(row["central_mg_l"] for row in late_rows) / len(late_rows)
+
+        # With the default SystemConfig flow/interval, the pre-fix formula (dose = target x volume,
+        # ignoring washout between doses) converges to roughly target / (k x interval) =~ 2.7 mg/L here,
+        # not the intended 9 mg/L target.
+        self.assertAlmostEqual(late_avg_mg_l, 9.0, delta=1.0)
+
+    def test_overflow_scenario_uses_solved_central_stock_not_a_fixed_constant(self):
+        system = SystemConfig(extra_volume_ml=241, q_extra_to_central_ml_min=0, q_central_diluent_ml_min=0.65)
+        target_css_mg_l = 9.0
+
+        solver = solve_css_cmax_replacement(
+            system=system,
+            drug_name="imipenem",
+            target_css_mg_l=target_css_mg_l,
+            target_cmax_mg_l=20.0,
+            central_infusion_ml_min=6 / 60,
+            infusion_duration_min=60,
+            dosing_interval_min=360,
+            duration_h=48,
+            dt_min=1,
+        )
+        fos = FosfomycinConfig(
+            drug_name="imipenem",
+            central_stock_mg_ml=solver.central_stock_mg_ml,
+            extra_stock_mg_ml=0.0,
+            central_infusion_ml_min=6 / 60,
+            extra_infusion_ml_min=0.0,
+            infusion_duration_min=60,
+            dosing_interval_min=360,
+        )
+
+        result = simulate_hfim("overflow", system, fos, [], duration_h=48, dt_min=1)
+        cavg = result.summary["imipenem"]["central_cavg_0_24_mg_l"]
+
+        # A fosfomycin-specific hardcoded stock (5.897897 mg/mL, tuned for a ~150 mg/L target) would be
+        # wildly wrong for a 9 mg/L target; the solved stock should land close to the actual target instead.
+        self.assertNotAlmostEqual(solver.central_stock_mg_ml, 5.897897, places=1)
+        self.assertAlmostEqual(cavg, target_css_mg_l, delta=target_css_mg_l * 0.25)
+
+    def test_overflow_css_cmax_solver_uses_overflow_extra_infusion_basis(self):
+        system = SystemConfig(
+            central_bottle_ml=100,
+            cartridge_ml=70,
+            extra_volume_ml=241,
+            q_extra_to_central_ml_min=0.921,
+            q_extra_diluent_ml_min=0.921,
+            q_central_diluent_ml_min=0.65,
+        )
+
+        solver = solve_css_cmax_replacement(
+            system=system,
+            drug_name="fosfomycin",
+            target_css_mg_l=150,
+            target_cmax_mg_l=250,
+            central_infusion_ml_min=0.1,
+            infusion_duration_min=60,
+            dosing_interval_min=360,
+            scenario="overflow",
+            extra_infusion_ml_min=0.1,
+            duration_h=48,
+            dt_min=1,
+        )
+        fos = FosfomycinConfig(
+            drug_name="fosfomycin",
+            central_stock_mg_ml=solver.central_stock_mg_ml,
+            extra_stock_mg_ml=solver.extra_replacement_concentration_mg_ml,
+            central_infusion_ml_min=0.1,
+            extra_infusion_ml_min=0.1,
+            infusion_duration_min=60,
+            dosing_interval_min=360,
+        )
+
+        result = simulate_hfim("overflow", system, fos, [], duration_h=48, dt_min=1)
+        summary = result.summary["fosfomycin"]
+
+        self.assertGreater(solver.extra_replacement_concentration_mg_ml, 0)
+        self.assertAlmostEqual(summary["central_auc_0_24_mg_h_l"], solver.predicted_auc_0_24_mg_h_l, places=6)
+        self.assertAlmostEqual(summary["central_cmax_mg_l"], solver.predicted_cmax_mg_l, places=6)
+        self.assertAlmostEqual(summary["central_cavg_0_24_mg_l"], 150, places=6)
+
+    def test_cmin_overall_is_the_whole_series_minimum_not_a_steady_state_trough(self):
+        result = simulate_hfim(
+            scenario="overflow",
+            system=SystemConfig(),
+            fos=FosfomycinConfig(),
+            drugs=[],
+            duration_h=48,
+            dt_min=1,
+        )
+
+        summary = result.summary["fosfomycin"]
+
+        self.assertEqual(summary["central_cmin_overall_mg_l"], 0)
+        self.assertGreater(summary["central_cmin_after_24h_mg_l"], summary["central_cmin_overall_mg_l"])
 
     def test_intermediate_extra_drug_name_is_not_hard_coded_to_fosfomycin(self):
         result = simulate_hfim(

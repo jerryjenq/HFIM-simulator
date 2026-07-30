@@ -8,7 +8,16 @@ from pathlib import Path
 import textwrap
 
 from .agent import ask_setup_agent, build_agent_context
-from .pk import DrugConfig, FosfomycinConfig, SystemConfig, flow_for_half_life, half_life_for_flow, simulate_hfim, solve_css_cmax_replacement
+from .pk import (
+    DrugConfig,
+    FosfomycinConfig,
+    SystemConfig,
+    average_intermittent_rate,
+    flow_for_half_life,
+    half_life_for_flow,
+    simulate_hfim,
+    solve_css_cmax_replacement,
+)
 from .store import SimulationStore
 
 
@@ -102,6 +111,11 @@ def main() -> None:
             format="%.3f",
             disabled=scenario == "q24_replacement" or auto_flow_mode,
             key=_flow_widget_key("extra_diluent", scenario, auto_flow_mode, extra_volume_ml, target_system_half_life),
+            help=(
+                "Sets the extra-compartment diluent volume to prepare. This flow is not read by the PK "
+                "calculation - the simulator assumes the extra volume stays fixed. Keep it close to extra-to-central "
+                "(plus overflow demand while dosing) so the physical extra volume actually stays fixed."
+            ),
         )
         q_central_diluent = cols[5].number_input(
             "Central diluent (mL/min)",
@@ -116,6 +130,17 @@ def main() -> None:
                 auto_flow_mode,
                 central_bottle_ml + cartridge_ml + q_extra_to_central,
                 target_system_half_life,
+            ),
+        )
+        recirculation_ml_min = st.number_input(
+            "Cartridge recirculation (mL/min)",
+            min_value=1.0,
+            value=120.0,
+            step=5.0,
+            help=(
+                "Central-to-cartridge loop flow shown on the schematic below. This is a display-only label - "
+                "it does not feed into the PK calculation. Set it to match the actual recirculation pump rate "
+                "so the schematic reflects the real setup."
             ),
         )
         total_central_outflow = q_extra_to_central + q_central_diluent
@@ -145,6 +170,9 @@ def main() -> None:
                 f"For the extra compartment: ln(2) x {extra_volume_ml:g} mL / ({target_system_half_life:g} h x 60) = {auto_extra_flow:.3f} mL/min. "
                 f"For total central outflow: ln(2) x {central_bottle_ml + cartridge_ml:g} mL / ({target_system_half_life:g} h x 60) = {auto_central_flow:.3f} mL/min."
             )
+        extra_diluent_warning = _extra_diluent_balance_warning(scenario, q_extra_to_central, q_extra_diluent, extra_volume_ml)
+        if extra_diluent_warning:
+            st.warning(extra_diluent_warning)
 
     st.subheader("2. Drug targets and injection settings")
     st.caption("Choose the number of drugs, then set whether each drug should target AUC0-24, Cmax, or maintained Css. Dosing settings are split into loading dose, maintenance dosing, and dosing frequency.")
@@ -154,7 +182,7 @@ def main() -> None:
     st.caption(
         "This section solves central stock and q24h extra replacement concentration from target Css/Cavg and Cmax."
         if scenario == "q24_replacement"
-        else "This section corresponds to the drug-injection lines in the HFIM setup. Select which drug uses this central/extra setup, then enter stock concentration, dose volume, infusion duration, and dosing frequency."
+        else "This section solves central and extra stock concentrations for the overflow central/extra setup, then lets you manually override the suggested stock values."
     )
     st.info(_extra_setup_help_text(scenario))
     setup_drug_names = list(drug_inputs.keys())
@@ -169,7 +197,11 @@ def main() -> None:
         target_cols = st.columns(3)
         target_css_mg_l = target_cols[0].number_input("Target Css / Cavg (mg/L)", min_value=0.0, value=setup_drug_values["target_concentration_mg_l"], step=5.0)
         target_cmax_mg_l = target_cols[1].number_input("Target Cmax (mg/L)", min_value=0.0, value=250.0, step=5.0)
-        reservoir_replacement_interval_h = target_cols[2].number_input("Extra replacement interval (h)", min_value=0.1, value=24.0, step=1.0)
+        if scenario == "q24_replacement":
+            reservoir_replacement_interval_h = target_cols[2].number_input("Extra replacement interval (h)", min_value=0.1, value=24.0, step=1.0)
+        else:
+            reservoir_replacement_interval_h = 24.0
+            target_cols[2].metric("Extra strategy", "overflow q-dose")
 
         setup_cols = st.columns(4)
         fos_central_volume = setup_cols[0].number_input("Central dose volume (mL)", min_value=0.0, value=6.0, step=0.5)
@@ -185,26 +217,35 @@ def main() -> None:
             q_extra_diluent_ml_min=q_extra_diluent,
             q_central_diluent_ml_min=q_central_diluent,
         )
+        fos_central_rate = fos_central_volume / fos_duration
+        if scenario == "overflow":
+            overflow_setup_cols = st.columns(2)
+            fos_extra_volume = overflow_setup_cols[0].number_input("Extra dose volume (mL)", min_value=0.0, value=6.0, step=0.5)
+            fos_extra_rate = fos_extra_volume / fos_duration
+            overflow_setup_cols[1].metric("Extra pump rate", f"{fos_extra_rate:.3f} mL/min")
+        else:
+            fos_extra_volume = 0.0
+            fos_extra_rate = 0.0
+
         solver_result = solve_css_cmax_replacement(
             q24_system,
             setup_drug_name,
             target_css_mg_l,
             target_cmax_mg_l,
-            fos_central_volume / fos_duration,
+            fos_central_rate,
             fos_duration,
             fos_interval,
             replacement_interval_h=reservoir_replacement_interval_h,
+            scenario=scenario,
+            extra_infusion_ml_min=fos_extra_rate,
             duration_h=duration_h,
             dt_min=dt_min,
         )
         setup_cols[3].metric("Solved central stock", f"{solver_result.central_stock_mg_ml:.6f} mg/mL")
-        fos_central_stock = solver_result.central_stock_mg_ml if scenario == "q24_replacement" else 5.897897
-        fos_central_rate = fos_central_volume / fos_duration
+        fos_central_stock = solver_result.central_stock_mg_ml
 
         if scenario == "q24_replacement":
             fos_extra_stock = solver_result.extra_replacement_concentration_mg_ml
-            fos_extra_volume = 0.0
-            fos_extra_rate = 0.0
             preload_extra_mg = 0.0
             extra_transfer_volume_ml = q_extra_to_central * reservoir_replacement_interval_h * 60
             solver_cols = st.columns(4)
@@ -226,12 +267,37 @@ def main() -> None:
                     f"Lower Qextra, increase extra volume, or shorten the replacement interval."
                 )
         else:
-            extra_cols = st.columns(3)
-            fos_extra_stock = extra_cols[0].number_input("Extra stock (mg/mL)", min_value=0.0, value=8.351422, step=0.1, format="%.6f")
-            fos_extra_volume = extra_cols[1].number_input("Extra dose volume (mL)", min_value=0.0, value=6.0, step=0.5)
+            solver_cols = st.columns(4)
+            solver_cols[0].metric("Solved extra stock", f"{solver_result.extra_replacement_concentration_mg_ml:.6f} mg/mL")
+            solver_cols[1].metric("Predicted Cavg", f"{solver_result.predicted_cavg_mg_l:.1f} mg/L")
+            solver_cols[2].metric("Predicted Cmax", f"{solver_result.predicted_cmax_mg_l:.1f} mg/L", f"{solver_result.cmax_error_mg_l:+.1f}")
+            solver_cols[3].metric("Predicted Cmin after 24h", f"{solver_result.predicted_cmin_mg_l:.1f} mg/L")
+            if solver_result.feasible:
+                st.success(solver_result.message)
+            else:
+                st.warning(solver_result.message)
+            manual_cols = st.columns(3)
+            fos_central_stock = manual_cols[0].number_input(
+                "Central stock (mg/mL)",
+                min_value=0.0,
+                value=fos_central_stock,
+                step=0.1,
+                format="%.6f",
+                help=(
+                    "Defaults to the overflow Css/Cmax solver result. The final simulated Cavg/Cmax in "
+                    "Section 5 updates if you manually override this stock concentration."
+                ),
+            )
+            fos_extra_stock = manual_cols[1].number_input(
+                "Extra stock (mg/mL)",
+                min_value=0.0,
+                value=solver_result.extra_replacement_concentration_mg_ml,
+                step=0.1,
+                format="%.6f",
+                help="Defaults to the overflow Css/Cmax solver result for the selected extra q-dose volume.",
+            )
             preload_default = fos_extra_stock * fos_extra_volume
-            preload_extra_mg = extra_cols[2].number_input("Extra preload amount (mg)", min_value=0.0, value=preload_default, step=1.0)
-            fos_extra_rate = fos_extra_volume / fos_duration
+            preload_extra_mg = manual_cols[2].number_input("Extra preload amount (mg)", min_value=0.0, value=preload_default, step=1.0)
         if scenario == "q24_replacement":
             st.caption(
                 f"Calculated central pump rate: {fos_central_rate:.3f} mL/min. "
@@ -300,6 +366,7 @@ def main() -> None:
         "Waste": f"{q_extra_to_central + q_central_diluent:g} mL/min",
         "Extra overflow": f"{fos.extra_infusion_ml_min:g} mL/min while dosing",
         "Reservoir interval": f"q{reservoir_replacement_interval_h:g}h",
+        "Recirculation": f"{recirculation_ml_min:g} mL/min",
     }, injection_values=_schematic_injection_values(drug_inputs, fos, scenario, result.summary), scenario=scenario)
     st.image(_figure_export_bytes(setup_schematic_fig, "png", dpi=300), width="stretch")
     export_cols = st.columns([1, 1, 1, 5])
@@ -329,14 +396,14 @@ def main() -> None:
 
     run_and_save = st.button("Run and save to SQLite")
     setup_summary = result.summary[setup_drug_name]
-    setup_target_auc = target_css_mg_l * 24 if scenario == "q24_replacement" else setup_drug_values["target_value"] if setup_drug_values["target_type"] == "AUC0-24 exposure" else 0
+    setup_target_auc = target_css_mg_l * 24
 
     st.subheader("5. Result overview")
     cols = st.columns(5)
     cols[0].metric(f"{setup_drug_name} AUC0-24", f"{setup_summary['central_auc_0_24_mg_h_l']:.1f}", f"target {setup_target_auc:g}" if setup_target_auc else None)
-    cols[1].metric("Central Cavg/Css", f"{setup_summary['central_cavg_0_24_mg_l']:.1f} mg/L", f"target {target_css_mg_l:g}" if scenario == "q24_replacement" else None)
-    cols[2].metric(f"{setup_drug_name} Cmax central", f"{setup_summary['central_cmax_mg_l']:.1f} mg/L", f"target {target_cmax_mg_l:g}" if scenario == "q24_replacement" else None)
-    cmin_value = setup_summary.get("central_cmin_after_24h_mg_l", setup_summary["central_cmin_mg_l"])
+    cols[1].metric("Central Cavg/Css", f"{setup_summary['central_cavg_0_24_mg_l']:.1f} mg/L", f"target {target_css_mg_l:g}")
+    cols[2].metric(f"{setup_drug_name} Cmax central", f"{setup_summary['central_cmax_mg_l']:.1f} mg/L", f"target {target_cmax_mg_l:g}")
+    cmin_value = setup_summary["central_cmin_after_24h_mg_l"]
     cols[3].metric(f"{setup_drug_name} Cmin after 24h", f"{cmin_value:.1f} mg/L")
     if scenario == "q24_replacement":
         cols[4].metric("Extra replacement", f"{fos.extra_stock_mg_ml:.6f} mg/mL")
@@ -501,6 +568,12 @@ def _drug_input_panel(st, active_drug_count: int) -> dict[str, dict]:
                 f"{name or 'This drug'}: the shortest active half-life sets the shared central-to-waste flow. "
                 "If this value becomes the shortest half-life, the whole central system flow and maintenance drug amounts increase."
             )
+            if target_type == "Cmax after loading dose":
+                st.caption(
+                    f"{name or 'This drug'}: loading dose is enabled by default and its loading target defaults "
+                    "to this Cmax value directly (not a multiplier). Sustained accumulation over repeat maintenance "
+                    "dosing is not solved automatically here - use the Section 3 solver for full Css/Cmax optimization."
+                )
 
             dosing_cols = st.columns(3)
             if name == "fosfomycin":
@@ -519,7 +592,11 @@ def _drug_input_panel(st, active_drug_count: int) -> dict[str, dict]:
                 )
                 dosing_mode = "q6h central + extra infusion"
             else:
-                loading_dose = dosing_cols[0].checkbox("Loading dose", value=default["loading_dose"], key=f"loading_dose_{index}")
+                loading_dose = dosing_cols[0].checkbox(
+                    "Loading dose",
+                    value=_loading_dose_default_for_target_type(default["loading_dose"], target_type),
+                    key=f"loading_dose_{index}",
+                )
                 maintenance = dosing_cols[1].selectbox(
                     "Maintenance dosing",
                     ["continuous infusion", "intermittent infusion", "no maintenance"],
@@ -544,7 +621,7 @@ def _drug_input_panel(st, active_drug_count: int) -> dict[str, dict]:
                 loading_target = detail_cols[0].number_input(
                     "Loading target (mg/L)",
                     min_value=0.0,
-                    value=target_value * default["loading_target_multiplier"],
+                    value=_loading_target_default_mg_l(target_value, target_type, default["loading_target_multiplier"]),
                     step=1.0,
                     key=f"loading_target_{index}",
                 )
@@ -638,6 +715,28 @@ def _state_get(state, key: str, default):
         return state[key]
     except (KeyError, TypeError):
         return default
+
+
+def _extra_diluent_balance_warning(
+    scenario: str,
+    q_extra_to_central_ml_min: float,
+    q_extra_diluent_ml_min: float,
+    extra_volume_ml: float,
+) -> str | None:
+    if scenario != "overflow":
+        return None
+    imbalance = q_extra_diluent_ml_min - q_extra_to_central_ml_min
+    if abs(imbalance) <= 1e-6:
+        return None
+    direction = "less than" if imbalance < 0 else "more than"
+    drift = "drain" if imbalance < 0 else "overfill"
+    return (
+        f"Extra diluent ({q_extra_diluent_ml_min:.3f} mL/min) is {direction} extra-to-central "
+        f"({q_extra_to_central_ml_min:.3f} mL/min) by {abs(imbalance):.3f} mL/min. This flow is not used in "
+        f"the PK calculation - the simulator assumes the extra volume stays fixed at {extra_volume_ml:g} mL. "
+        f"In the real system this mismatch will {drift} the extra compartment over time; match extra diluent "
+        "to extra-to-central (plus overflow demand while dosing) to keep the physical volume stable."
+    )
 
 
 def _qextra_default_for_scenario(scenario: str, flow_mode: str, auto_extra_flow: float) -> float:
@@ -760,6 +859,16 @@ def _target_to_concentration(target_type: str, target_value: float) -> float:
     return target_value
 
 
+def _loading_dose_default_for_target_type(base_default: bool, target_type: str) -> bool:
+    return base_default or target_type == "Cmax after loading dose"
+
+
+def _loading_target_default_mg_l(target_value: float, target_type: str, multiplier: float) -> float:
+    if target_type == "Cmax after loading dose":
+        return target_value
+    return target_value * multiplier
+
+
 def _setup_overview_rows(
     central_bottle_ml: float,
     cartridge_ml: float,
@@ -772,6 +881,10 @@ def _setup_overview_rows(
 ) -> list[dict]:
     central_volume = central_bottle_ml + cartridge_ml
     total_central_outflow = q_extra_to_central + q_central_diluent
+    setup_average_flow = average_intermittent_rate(
+        fos.central_infusion_ml_min, fos.infusion_duration_min, fos.dosing_interval_min
+    )
+    ci_effective_outflow = total_central_outflow + setup_average_flow
     central_half_life = half_life_for_flow(central_volume, total_central_outflow) if total_central_outflow > 0 else None
     extra_half_life = half_life_for_flow(extra_volume_ml, q_extra_to_central) if q_extra_to_central > 0 else None
     if scenario == "q24_replacement":
@@ -786,10 +899,12 @@ def _setup_overview_rows(
         extra_transfer_use = f"sets extra washout half-life ≈ {_fmt_optional(extra_half_life)} h"
     rows = [
         {"Part": "Central effective volume", "Current value": f"{central_volume:g} mL", "How to use": "central bottle + cartridge; larger volume needs higher flow for same half-life"},
-        {"Part": "Central diluent", "Current value": f"{q_central_diluent:g} mL/min", "How to use": "remaining blank inflow after Qextra; together with Qextra it sets central washout"},
+        {"Part": "Central diluent", "Current value": f"{q_central_diluent:g} mL/min", "How to use": "shared q24h reservoir flow; CI drug concentration is calculated from this pump rate"},
+        {"Part": "Setup central pump average", "Current value": f"{setup_average_flow:g} mL/min", "How to use": "time-weighted average of the selected drug central q-dose pump; included in CI drug washout"},
+        {"Part": "CI effective outflow", "Current value": f"{ci_effective_outflow:g} mL/min", "How to use": "Qextra + central diluent + setup central pump average; used to calculate imipenem/relebactam CI mg/h"},
         {"Part": "Extra volume", "Current value": f"{extra_volume_ml:g} mL", "How to use": extra_volume_use},
         {"Part": "Extra to central", "Current value": f"{q_extra_to_central:g} mL/min", "How to use": extra_transfer_use},
-        {"Part": "Waste", "Current value": f"{total_central_outflow:g} mL/min", "How to use": f"total central output; shared central half-life ≈ {_fmt_optional(central_half_life)} h"},
+        {"Part": "Baseline waste", "Current value": f"{total_central_outflow:g} mL/min", "How to use": f"baseline central output from Qextra + central diluent; shared central half-life ≈ {_fmt_optional(central_half_life)} h"},
     ]
     if scenario == "q24_replacement":
         rows.append({
@@ -1037,7 +1152,10 @@ def _plot_setup_schematic(system_values: dict[str, str], injection_values: dict[
             chunks = textwrap.wrap(line, width=width, break_long_words=False, break_on_hyphens=False) or [""]
             wrapped.extend(chunks)
         if len(wrapped) > max_lines:
-            wrapped = wrapped[: max_lines - 1] + ["..."]
+            omitted = len(wrapped) - (max_lines - 1)
+            # Name what was cut instead of a bare "...", since Section 7 has the full, correct numbers
+            # this diagram cannot fit - a silent "..." would hide a real dose/concentration line.
+            wrapped = wrapped[: max_lines - 1] + [f"+{omitted} more (see Section 7)"]
         return wrapped
 
     def semantic_text_color(line: str) -> str:
@@ -1209,7 +1327,7 @@ def _plot_setup_schematic(system_values: dict[str, str], injection_values: dict[
         color=colors["amber"],
         bbox={"facecolor": "white", "edgecolor": "none", "pad": 1.0, "alpha": 0.92},
     )
-    arrow((4.08, 4.7), (4.08, 5.78), "120 mL/min", color=colors["line"], label_color=colors["amber"])
+    arrow((4.08, 4.7), (4.08, 5.78), system_values["Recirculation"], color=colors["line"], label_color=colors["amber"])
     arrow((4.48, 5.78), (4.48, 4.82), "", color=colors["line"])
     ax.text(1.10, 7.42, f"{setup_drug} to central", ha="left", va="bottom", fontsize=8.8, weight="bold", color=colors["blue"])
     ax.text(3.28, 7.42, " / ".join(injection_values.get("central_other_drugs", [])) or "Other central dosing", ha="left", va="bottom", fontsize=8.8, weight="bold", color=colors["blue"])
@@ -1238,6 +1356,7 @@ def _plot_setup_schematic(system_values: dict[str, str], injection_values: dict[
         accent=colors["blue"],
         facecolor=colors["blue_fill"],
         wrap_width=34,
+        max_lines=7,
         body_fontsize=6.0,
         line_step=0.13,
     )
@@ -1252,7 +1371,7 @@ def _plot_setup_schematic(system_values: dict[str, str], injection_values: dict[
         accent=colors["blue"],
         facecolor="#eef2ff",
         wrap_width=62,
-        max_lines=8,
+        max_lines=9,
         body_fontsize=5.45,
         line_step=0.12,
     )
@@ -1791,7 +1910,7 @@ def _interpretation_text(scenario: str, setup_drug_name: str, setup_summary: dic
         f"- {setup_text}\n"
         f"- {setup_drug_name} central AUC0-24 = **{auc:.1f} mg*h/L**"
         + (f"; difference from target {setup_target_auc:.1f} is **{delta:+.1f} mg*h/L**." if setup_target_auc else ".")
-        + f"\n- Central Cavg = **{setup_summary['central_cavg_0_24_mg_l']:.1f} mg/L**; Cmax = **{setup_summary['central_cmax_mg_l']:.1f} mg/L**; Cmin after 24 h = **{setup_summary.get('central_cmin_after_24h_mg_l', setup_summary['central_cmin_mg_l']):.1f} mg/L**."
+        + f"\n- Central Cavg = **{setup_summary['central_cavg_0_24_mg_l']:.1f} mg/L**; Cmax = **{setup_summary['central_cmax_mg_l']:.1f} mg/L**; Cmin after 24 h = **{setup_summary['central_cmin_after_24h_mg_l']:.1f} mg/L**."
     ]
     for name in drug_names:
         item = summary[name]
@@ -1821,6 +1940,10 @@ def _equation_text(
     daily_central_mg = central_dose_mg * 24 / dose_interval_h
     central_daily_volume = q_central_diluent * 24 * 60
     total_central_outflow = system.q_waste_ml_min
+    setup_central_average_flow = average_intermittent_rate(
+        fos.central_infusion_ml_min, fos.infusion_duration_min, fos.dosing_interval_min
+    )
+    ci_effective_outflow = total_central_outflow + setup_central_average_flow
     target_central_outflow = flow_for_half_life(central_volume, target_system_half_life)
     extra_replacement_mg = fos.extra_stock_mg_ml * system.extra_volume_ml
     extra_transfer_volume_ml = system.q_extra_to_central_ml_min * fos.reservoir_replacement_interval_h * 60
@@ -1837,6 +1960,13 @@ def _equation_text(
         "   Qcentral_out_actual = Qextra_to_central + Qcentral_diluent",
         f"   Qcentral_out_actual = {system.q_extra_to_central_ml_min:.6g} + {q_central_diluent:.6g} = {total_central_outflow:.6g} mL/min",
         "   Qcentral_diluent = max(0, Qcentral_out_target - Qextra_to_central) in auto mode",
+        "   Continuous-infusion drugs mixed into central diluent use a time-weighted effective outflow:",
+        "   Qsetup_central_average = Qsetup_central x infusion_duration / dosing_interval",
+        f"   Qsetup_central_average = {fos.central_infusion_ml_min:.6g} x {fos.infusion_duration_min:g} / {fos.dosing_interval_min:g} = {setup_central_average_flow:.6g} mL/min",
+        "   QCI_effective_outflow = Qcentral_out_actual + Qsetup_central_average",
+        f"   QCI_effective_outflow = {total_central_outflow:.6g} + {setup_central_average_flow:.6g} = {ci_effective_outflow:.6g} mL/min",
+        "   For each CI drug: CI input mg/min = Css_target x QCI_effective_outflow / 1000",
+        "   Central diluent reservoir concentration = CI input mg/min / Qcentral_diluent",
     ]
     if scenario == "q24_replacement":
         max_single_fill_qextra = system.extra_volume_ml / (fos.reservoir_replacement_interval_h * 60)

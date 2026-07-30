@@ -1,10 +1,19 @@
+import inspect
+import os
 import unittest
 
+os.environ.setdefault("MPLBACKEND", "Agg")
+
+from hfim_simulator import app as app_module
 from hfim_simulator.app import (
     _central_diluent_default_for_flow_mode,
     _central_diluent_reservoir_rows,
     _central_diluent_reservoir_summary,
+    _equation_text,
+    _extra_diluent_balance_warning,
     _figure_export_bytes,
+    _loading_dose_default_for_target_type,
+    _loading_target_default_mg_l,
     _plot_setup_schematic,
     _preparation_destination_cards,
     _preparation_review_rows,
@@ -12,6 +21,7 @@ from hfim_simulator.app import (
     _prep_rows_for_display,
     _replacement_solution_rows,
     _replacement_solution_summary,
+    _setup_overview_rows,
     _normalized_unique_drug_name,
     _qextra_default_for_scenario,
 )
@@ -285,6 +295,80 @@ class HfimAppLogicTest(unittest.TestCase):
         self.assertEqual(imipenem_ld["Volume"], "5 mL")
         self.assertIn("10.00 mL/h", imipenem_ld["Note"])
 
+    def test_extra_diluent_balance_warning_flags_mismatch_in_overflow_only(self):
+        self.assertIsNone(_extra_diluent_balance_warning("q24_replacement", 0.167, 0.921, 241))
+        self.assertIsNone(_extra_diluent_balance_warning("overflow", 0.921, 0.921, 241))
+
+        warning = _extra_diluent_balance_warning("overflow", 0.921, 0.3, 241)
+
+        self.assertIsNotNone(warning)
+        self.assertIn("not used in the PK calculation", warning)
+        self.assertIn("0.621", warning)
+
+    def test_cmax_target_type_defaults_loading_dose_on_and_uses_target_directly(self):
+        self.assertTrue(_loading_dose_default_for_target_type(False, "Cmax after loading dose"))
+        self.assertTrue(_loading_dose_default_for_target_type(True, "Maintain concentration"))
+        self.assertFalse(_loading_dose_default_for_target_type(False, "Maintain concentration"))
+
+        self.assertEqual(_loading_target_default_mg_l(9.0, "Cmax after loading dose", 2.0), 9.0)
+        self.assertEqual(_loading_target_default_mg_l(9.0, "Maintain concentration", 2.0), 18.0)
+
+    def test_setup_overview_shows_ci_effective_outflow_from_setup_pump_average(self):
+        rows = _setup_overview_rows(
+            central_bottle_ml=100,
+            cartridge_ml=0,
+            extra_volume_ml=50,
+            q_extra_to_central=0.1,
+            q_extra_diluent=0,
+            q_central_diluent=0.2,
+            scenario="q24_replacement",
+            fos=FosfomycinConfig(
+                central_infusion_ml_min=0.6,
+                infusion_duration_min=120,
+                dosing_interval_min=360,
+            ),
+        )
+        by_part = {row["Part"]: row for row in rows}
+
+        self.assertEqual(by_part["Setup central pump average"]["Current value"], "0.2 mL/min")
+        self.assertEqual(by_part["CI effective outflow"]["Current value"], "0.5 mL/min")
+        self.assertIn("used to calculate imipenem/relebactam CI mg/h", by_part["CI effective outflow"]["How to use"])
+
+    def test_equation_text_includes_ci_reservoir_mass_balance(self):
+        text = _equation_text(
+            SystemConfig(
+                central_bottle_ml=100,
+                cartridge_ml=0,
+                extra_volume_ml=50,
+                q_extra_to_central_ml_min=0.1,
+                q_central_diluent_ml_min=0.2,
+            ),
+            FosfomycinConfig(
+                central_infusion_ml_min=0.6,
+                infusion_duration_min=120,
+                dosing_interval_min=360,
+            ),
+            {
+                "central_auc_0_24_mg_h_l": 3600,
+                "central_cavg_0_24_mg_l": 150,
+            },
+            setup_target_auc=3600,
+            scenario="q24_replacement",
+            duration_h=24,
+            q_central_diluent=0.2,
+            q_extra_diluent=0,
+            target_system_half_life=1.25,
+        )
+
+        self.assertIn("Qsetup_central_average = 0.6 x 120 / 360 = 0.2 mL/min", text)
+        self.assertIn("QCI_effective_outflow = 0.3 + 0.2 = 0.5 mL/min", text)
+        self.assertIn("Central diluent reservoir concentration = CI input mg/min / Qcentral_diluent", text)
+
+    def test_overflow_central_stock_is_not_hardcoded_to_a_fosfomycin_constant(self):
+        source = inspect.getsource(app_module.main)
+
+        self.assertNotIn("5.897897", source)
+
     def test_presentation_schematic_exports_editable_svg_text(self):
         system_values = {
             "Central": "100 mL",
@@ -296,6 +380,7 @@ class HfimAppLogicTest(unittest.TestCase):
             "Waste": "1.571 mL/min",
             "Extra overflow": "0 mL/min while dosing",
             "Reservoir interval": "q24h",
+            "Recirculation": "120 mL/min",
         }
         injection_values = {
             "setup_central": ["central q6h infusion", "stock 5.4088 mg/mL", "6 mL over 1 h", "32.45 mg/dose"],
@@ -314,6 +399,35 @@ class HfimAppLogicTest(unittest.TestCase):
         self.assertIn(b"HFIM system overview", svg)
         self.assertIn(b"Protocol recipe", svg)
         self.assertGreater(len(png), 100_000)
+
+    def test_schematic_uses_a_labeled_overflow_note_instead_of_bare_ellipsis(self):
+        system_values = {
+            "Central": "170 mL",
+            "Cartridge": "70 mL",
+            "Extra": "241 mL",
+            "Extra to central": "0.167 mL/min",
+            "Extra diluent": "0 mL/min",
+            "Central diluent": "1.404 mL/min",
+            "Waste": "1.571 mL/min",
+            "Extra overflow": "0 mL/min while dosing",
+            "Reservoir interval": "q24h",
+            "Recirculation": "120 mL/min",
+        }
+        many_lines = [f"drug{i} CI in Diluent Central: {i}.000 mg" for i in range(20)]
+        injection_values = {
+            "setup_central": ["central q6h infusion", "stock 5.4088 mg/mL"],
+            "central_other": many_lines,
+            "central_other_drugs": [f"drug{i}" for i in range(20)],
+            "central_diluent": ["prepare 2022 mL/q24h"],
+            "extra": ["full compartment replacement"],
+            "setup_drug": "fosfomycin",
+        }
+
+        fig = _plot_setup_schematic(system_values, injection_values, "q24_replacement")
+        svg = _figure_export_bytes(fig, "svg")
+
+        self.assertNotIn(b"...", svg)
+        self.assertIn(b"more (see Section 7)", svg)
 
 
 if __name__ == "__main__":

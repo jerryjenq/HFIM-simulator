@@ -127,7 +127,11 @@ def compute_continuous_infusion(
     loading_concentration_mg_ml = loading_dose_mg / loading_volume_ml if loading_volume_ml > 0 else 0.0
     loading_infusion_rate_ml_h = loading_volume_ml / loading_duration_h if loading_duration_h > 0 else 0.0
     loading_infusion_rate_ml_min = loading_volume_ml / (loading_duration_h * 60) if loading_duration_h > 0 else 0.0
-    intermittent_dose_mg = target_mg_ml * central_volume_ml
+    # Dose per interval that delivers the same average mg/min as continuous infusion at steady state
+    # (Dose / interval = CL x Css, the standard multiple-dose superposition identity). This makes
+    # repeated intermittent dosing converge to the target Css instead of drifting away from it based on
+    # how the interval happens to compare with the washout half-life.
+    intermittent_dose_mg = infusion_rate_mg_min * (intermittent_interval_h * 60)
     return ContinuousInfusionRegimen(
         target_concentration_mg_l=target_concentration_mg_l,
         half_life_h=half_life_h,
@@ -181,6 +185,13 @@ def simulate_hfim(
     extra_q6h_dose_count = 0
     overflow_loss_mg = 0.0
 
+    setup_central_average_flow_ml_min = average_intermittent_rate(
+        fos.central_infusion_ml_min,
+        fos.infusion_duration_min,
+        fos.dosing_interval_min,
+    )
+    shared_continuous_elimination_flow_ml_min = system.q_waste_ml_min + setup_central_average_flow_ml_min
+
     continuous = {
         drug.name: compute_continuous_infusion(
             drug.target_concentration_mg_l,
@@ -191,7 +202,7 @@ def simulate_hfim(
             loading_volume_ml=drug.loading_volume_ml,
             intermittent_interval_h=drug.intermittent_interval_h,
             intermittent_duration_h=drug.intermittent_duration_h,
-            shared_elimination_flow_ml_min=system.q_waste_ml_min,
+            shared_elimination_flow_ml_min=shared_continuous_elimination_flow_ml_min,
         )
         for drug in drugs
     }
@@ -259,7 +270,10 @@ def simulate_hfim(
             amount = drug_amounts[name]
             concentration_mg_ml = amount / vc
             input_mg_min = _input_rate_for_mode(time_min, regimen, drug_configs[name].dosing_mode)
-            output_mg_min = system.q_waste_ml_min * concentration_mg_ml
+            # Every drug shares the same fixed central volume, so it washes out against the same total
+            # instantaneous outflow, including the setup drug's own central pump flow (q_fos_central),
+            # not just the shared diluent/extra-transfer flow.
+            output_mg_min = (system.q_waste_ml_min + q_fos_central) * concentration_mg_ml
             drug_amounts[name] = max(0.0, amount + (input_mg_min - output_mg_min) * dt_min)
 
     summary = {
@@ -298,9 +312,13 @@ def solve_css_cmax_replacement(
     infusion_duration_min: int,
     dosing_interval_min: int,
     replacement_interval_h: float = 24.0,
+    scenario: str = "q24_replacement",
+    extra_infusion_ml_min: float = 0.0,
     duration_h: float = 168,
     dt_min: float = 1,
 ) -> CssCmaxSolverResult:
+    if scenario not in {"q24_replacement", "overflow"}:
+        raise ValueError("scenario must be 'q24_replacement' or 'overflow'")
     target_auc = target_css_mg_l * 24
     central_basis = FosfomycinConfig(
         drug_name=drug_name,
@@ -318,14 +336,14 @@ def solve_css_cmax_replacement(
         central_stock_mg_ml=0.0,
         extra_stock_mg_ml=1.0,
         central_infusion_ml_min=central_infusion_ml_min,
-        extra_infusion_ml_min=0.0,
+        extra_infusion_ml_min=extra_infusion_ml_min if scenario == "overflow" else 0.0,
         infusion_duration_min=infusion_duration_min,
         dosing_interval_min=dosing_interval_min,
         preload_extra_mg=0.0,
         reservoir_replacement_interval_h=replacement_interval_h,
     )
-    central_result = simulate_hfim("q24_replacement", system, central_basis, [], duration_h=max(24, duration_h), dt_min=dt_min)
-    extra_result = simulate_hfim("q24_replacement", system, extra_basis, [], duration_h=max(24, duration_h), dt_min=dt_min)
+    central_result = simulate_hfim(scenario, system, central_basis, [], duration_h=max(24, duration_h), dt_min=dt_min)
+    extra_result = simulate_hfim(scenario, system, extra_basis, [], duration_h=max(24, duration_h), dt_min=dt_min)
     central_rows = [row for row in central_result.rows if row["drug"] == drug_name]
     extra_rows = [row for row in extra_result.rows if row["drug"] == drug_name]
     central_profile = [row["central_mg_l"] for row in central_rows]
@@ -469,6 +487,13 @@ def _q6h_rate(time_min: float, rate_ml_min: float, duration_min: int, interval_m
     return rate_ml_min if time_min % interval_min < duration_min else 0.0
 
 
+def average_intermittent_rate(rate_ml_min: float, duration_min: int, interval_min: int) -> float:
+    if rate_ml_min <= 0 or duration_min <= 0 or interval_min <= 0:
+        return 0.0
+    duty_cycle = min(duration_min, interval_min) / interval_min
+    return rate_ml_min * duty_cycle
+
+
 def _is_dose_start(time_min: float, interval_min: int) -> bool:
     return abs(time_min % interval_min) < 1e-9
 
@@ -554,7 +579,9 @@ def _summarize_intermit(rows: list[dict], drug_name: str, overflow_loss_mg: floa
     extra = [row["extra_mg_l"] for row in drug_rows]
     return {
         "central_cmax_mg_l": max(central),
-        "central_cmin_mg_l": min(central),
+        # Minimum over the whole series, dominated by the pre-dose baseline (0 at t=0) - not a
+        # steady-state trough. Use central_cmin_after_24h_mg_l for the clinically meaningful trough.
+        "central_cmin_overall_mg_l": min(central),
         "central_cmin_after_24h_mg_l": min(
             row["central_mg_l"]
             for row in drug_rows
@@ -562,7 +589,8 @@ def _summarize_intermit(rows: list[dict], drug_name: str, overflow_loss_mg: floa
         ) if any(row["time_h"] >= 24 for row in drug_rows) else min(central),
         "central_cavg_0_24_mg_l": _auc(drug_rows, "central_mg_l", 24) / 24,
         "extra_cmax_mg_l": max(extra),
-        "extra_cmin_mg_l": min(extra),
+        # Same caveat as central_cmin_overall_mg_l - whole-series minimum, not a steady-state trough.
+        "extra_cmin_overall_mg_l": min(extra),
         "central_auc_0_24_mg_h_l": _auc(drug_rows, "central_mg_l", 24),
         "extra_auc_0_24_mg_h_l": _auc(drug_rows, "extra_mg_l", 24),
         "central_auc_full_mg_h_l": _auc(drug_rows, "central_mg_l", None),

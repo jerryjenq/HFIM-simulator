@@ -9,6 +9,10 @@ from pathlib import Path
 from .pk import DrugConfig, FosfomycinConfig, SystemConfig, flow_for_half_life, simulate_hfim, solve_css_cmax_replacement
 from .store import SimulationStore
 
+FOS_HALF_LIFE_H = 3.0
+IMIPENEM_HALF_LIFE_H = 1.25
+RELEBACTAM_HALF_LIFE_H = 1.25
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the HFIM three-drug PK simulator.")
@@ -39,7 +43,9 @@ def main() -> None:
         if args.q_extra_to_central_ml_min is not None
         else 0.167 if args.scenario == "q24_replacement" else SystemConfig().q_extra_to_central_ml_min
     )
-    shared_central_half_life_h = min(3.0, 1.25, 1.25)
+    # Derived from the same half-life constants used for the DrugConfig entries below, so the shared
+    # flow can never silently desync from the drugs actually simulated by the CLI.
+    shared_central_half_life_h = min(FOS_HALF_LIFE_H, IMIPENEM_HALF_LIFE_H, RELEBACTAM_HALF_LIFE_H)
     base_system = SystemConfig(extra_volume_ml=args.extra_volume_ml)
     shared_central_outflow = flow_for_half_life(base_system.central_volume_ml, shared_central_half_life_h)
     q_central_diluent = max(0.0, shared_central_outflow - q_extra_to_central)
@@ -85,14 +91,14 @@ def main() -> None:
         DrugConfig(
             "imipenem",
             args.imipenem_target_mg_l,
-            1.25,
+            IMIPENEM_HALF_LIFE_H,
             loading_target_concentration_mg_l=args.imipenem_target_mg_l * 2,
             loading_duration_h=0.5,
         ),
         DrugConfig(
             "relebactam",
             args.imipenem_target_mg_l * 2 / 3,
-            1.25,
+            RELEBACTAM_HALF_LIFE_H,
             loading_target_concentration_mg_l=args.imipenem_target_mg_l * 4 / 3,
             loading_duration_h=0.5,
         ),
