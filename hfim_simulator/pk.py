@@ -152,6 +152,29 @@ def compute_continuous_infusion(
     )
 
 
+def intermittent_peak_trough(
+    cavg_mg_l: float,
+    half_life_h: float,
+    interval_h: float,
+    infusion_duration_h: float,
+) -> tuple[float, float]:
+    """Steady-state Cmax/Cmin for repeated IV infusion holding Cavg fixed.
+
+    In a central-only system Cavg is set by dose/interval alone, so once the target Cavg is fixed
+    the peak-to-trough shape is fully determined by half-life vs interval vs infusion duration -
+    it is not an independent target. This closed form lets the UI show what Cmax/Cmin each candidate
+    interval would produce, making the interval visible as the lever that shapes the peak.
+    """
+    if cavg_mg_l <= 0 or half_life_h <= 0 or interval_h <= 0 or infusion_duration_h <= 0:
+        return 0.0, 0.0
+    duration = min(infusion_duration_h, interval_h)
+    k = math.log(2) / half_life_h
+    accumulation = (1 - math.exp(-k * duration)) / (1 - math.exp(-k * interval_h))
+    cmax = cavg_mg_l * (interval_h / duration) * accumulation
+    cmin = cmax * math.exp(-k * (interval_h - duration))
+    return cmax, cmin
+
+
 def flow_for_half_life(volume_ml: float, half_life_h: float) -> float:
     if volume_ml <= 0 or half_life_h <= 0:
         raise ValueError("volume_ml and half_life_h must be positive")
@@ -167,15 +190,22 @@ def half_life_for_flow(volume_ml: float, flow_ml_min: float) -> float:
 def simulate_hfim(
     scenario: str,
     system: SystemConfig,
-    fos: FosfomycinConfig,
+    fos: FosfomycinConfig | None,
     drugs: list[DrugConfig],
     duration_h: float = 168,
     dt_min: float = 1,
 ) -> SimulationResult:
-    if scenario not in {"q24_replacement", "overflow"}:
-        raise ValueError("scenario must be 'q24_replacement' or 'overflow'")
+    if scenario not in {"q24_replacement", "overflow", "central_only"}:
+        raise ValueError("scenario must be 'q24_replacement', 'overflow', or 'central_only'")
     if dt_min <= 0:
         raise ValueError("dt_min must be positive")
+    if scenario == "central_only":
+        # Matched-half-life setup: no extra compartment and no setup drug at all. Every drug is
+        # dosed straight into central and washes out against the shared central flow, so there is
+        # no second compartment to reshape any drug's apparent half-life.
+        fos = None
+    elif fos is None:
+        raise ValueError("fos is required unless scenario is 'central_only'")
 
     steps = int(round(duration_h * 60 / dt_min))
     vc = system.central_volume_ml
@@ -185,10 +215,14 @@ def simulate_hfim(
     extra_q6h_dose_count = 0
     overflow_loss_mg = 0.0
 
-    setup_central_average_flow_ml_min = average_intermittent_rate(
-        fos.central_infusion_ml_min,
-        fos.infusion_duration_min,
-        fos.dosing_interval_min,
+    setup_central_average_flow_ml_min = (
+        average_intermittent_rate(
+            fos.central_infusion_ml_min,
+            fos.infusion_duration_min,
+            fos.dosing_interval_min,
+        )
+        if fos is not None
+        else 0.0
     )
     shared_continuous_elimination_flow_ml_min = system.q_waste_ml_min + setup_central_average_flow_ml_min
 
@@ -215,20 +249,20 @@ def simulate_hfim(
     rows = []
     for step in range(steps + 1):
         time_min = step * dt_min
-        if scenario == "q24_replacement" and _is_replacement_time(time_min, fos.reservoir_replacement_interval_h):
+        if fos is not None and scenario == "q24_replacement" and _is_replacement_time(time_min, fos.reservoir_replacement_interval_h):
             a_extra = fos.extra_stock_mg_ml * ve
         c_central_mg_l = a_central / vc * 1000
         c_extra_mg_l = a_extra / ve * 1000
-        row = {
-            "time_min": time_min,
-            "time_h": time_min / 60,
-            "drug": fos.drug_name,
-            "central_mg_l": c_central_mg_l,
-            "extra_mg_l": c_extra_mg_l,
-            "central_volume_ml": vc,
-            "extra_volume_ml": ve,
-        }
-        rows.append(row)
+        if fos is not None:
+            rows.append({
+                "time_min": time_min,
+                "time_h": time_min / 60,
+                "drug": fos.drug_name,
+                "central_mg_l": c_central_mg_l,
+                "extra_mg_l": c_extra_mg_l,
+                "central_volume_ml": vc,
+                "extra_volume_ml": ve,
+            })
         for name, amount in drug_amounts.items():
             rows.append({
                 "time_min": time_min,
@@ -243,17 +277,23 @@ def simulate_hfim(
         if step == steps:
             break
 
-        q_fos_central = _q6h_rate(time_min, fos.central_infusion_ml_min, fos.infusion_duration_min, fos.dosing_interval_min)
+        q_fos_central = (
+            _q6h_rate(time_min, fos.central_infusion_ml_min, fos.infusion_duration_min, fos.dosing_interval_min)
+            if fos is not None
+            else 0.0
+        )
         q_fos_extra = 0.0
-        if scenario == "overflow":
+        if fos is not None and scenario == "overflow":
             q_fos_extra = _q6h_rate(time_min, fos.extra_infusion_ml_min, fos.infusion_duration_min, fos.dosing_interval_min)
             if q_fos_extra > 0 and _is_dose_start(time_min, fos.dosing_interval_min):
                 extra_q6h_dose_count += 1
         c_central_mg_ml = a_central / vc
         c_extra_mg_ml = a_extra / ve
-        central_input_mg_min = q_fos_central * fos.central_stock_mg_ml + system.q_extra_to_central_ml_min * c_extra_mg_ml
+        setup_central_stock_mg_ml = fos.central_stock_mg_ml if fos is not None else 0.0
+        setup_extra_stock_mg_ml = fos.extra_stock_mg_ml if fos is not None else 0.0
+        central_input_mg_min = q_fos_central * setup_central_stock_mg_ml + system.q_extra_to_central_ml_min * c_extra_mg_ml
         central_output_mg_min = (system.q_waste_ml_min + q_fos_central) * c_central_mg_ml
-        extra_input_mg_min = q_fos_extra * fos.extra_stock_mg_ml
+        extra_input_mg_min = q_fos_extra * setup_extra_stock_mg_ml
         extra_to_central_mg_min = system.q_extra_to_central_ml_min * c_extra_mg_ml
         extra_overflow_mg_min = q_fos_extra * c_extra_mg_ml if scenario == "overflow" else 0.0
         extra_delta_mg_min = (
@@ -277,9 +317,10 @@ def simulate_hfim(
             drug_amounts[name] = max(0.0, amount + (input_mg_min - output_mg_min) * dt_min)
 
     summary = {
-        fos.drug_name: _summarize_intermit(rows, fos.drug_name, overflow_loss_mg, extra_q6h_dose_count),
         "drug_preparation": _preparation_table(system, fos, continuous, drug_configs, scenario, duration_h),
     }
+    if fos is not None:
+        summary[fos.drug_name] = _summarize_intermit(rows, fos.drug_name, overflow_loss_mg, extra_q6h_dose_count)
     for name, regimen in continuous.items():
         diluent_formulation = _central_diluent_formulation(system, regimen, drug_configs[name].dosing_mode)
         summary[name] = {
@@ -613,13 +654,18 @@ def _auc(rows: list[dict], column: str, until_h: float | None) -> float:
 
 def _preparation_table(
     system: SystemConfig,
-    fos: FosfomycinConfig,
+    fos: FosfomycinConfig | None,
     continuous: dict[str, ContinuousInfusionRegimen],
     drug_configs: dict[str, DrugConfig],
     scenario: str,
     duration_h: float,
 ) -> list[dict]:
-    table = [
+    table: list[dict] = []
+    if fos is None:
+        # central_only: no setup drug, so emit no setup-drug central/extra rows at all rather than
+        # zero-amount placeholder rows that would show up as meaningless bench instructions.
+        return table + _central_drug_preparation_rows(system, continuous, drug_configs)
+    table.append(
         {
             "drug": fos.drug_name,
             "component": f"central q{fos.dosing_interval_min / 60:g}h infusion",
@@ -627,7 +673,7 @@ def _preparation_table(
             "daily_amount_mg": fos.central_dose_mg * 24 / (fos.dosing_interval_min / 60),
             "note": f"{fos.central_infusion_ml_min * fos.infusion_duration_min:g} mL over {fos.infusion_duration_min / 60:g} h",
         }
-    ]
+    )
     if scenario == "overflow":
         table.append({
             "drug": fos.drug_name,
@@ -656,6 +702,15 @@ def _preparation_table(
                 f"{duration_h:g} h uses {replacements:g} intervals = {replacement_amount_mg * replacements:.1f} mg"
             ),
         })
+    return table + _central_drug_preparation_rows(system, continuous, drug_configs)
+
+
+def _central_drug_preparation_rows(
+    system: SystemConfig,
+    continuous: dict[str, ContinuousInfusionRegimen],
+    drug_configs: dict[str, DrugConfig],
+) -> list[dict]:
+    table = []
     for name, regimen in continuous.items():
         dosing_mode = drug_configs[name].dosing_mode
         if dosing_mode in {"loading dose + continuous infusion", "loading dose + intermittent infusion", "loading dose only"}:

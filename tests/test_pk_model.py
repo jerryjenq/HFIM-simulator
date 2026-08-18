@@ -8,6 +8,7 @@ from hfim_simulator.pk import (
     compute_continuous_infusion,
     flow_for_half_life,
     half_life_for_flow,
+    intermittent_peak_trough,
     simulate_hfim,
     solve_css_cmax_replacement,
 )
@@ -588,6 +589,93 @@ class HfimPkModelTest(unittest.TestCase):
 
         self.assertEqual(summary["central_cmin_overall_mg_l"], 0)
         self.assertGreater(summary["central_cmin_after_24h_mg_l"], summary["central_cmin_overall_mg_l"])
+
+    def test_central_only_emits_no_phantom_setup_drug_rows_or_prep_lines(self):
+        system = SystemConfig(
+            central_bottle_ml=100, cartridge_ml=70, extra_volume_ml=1.0,
+            q_extra_to_central_ml_min=0.0, q_extra_diluent_ml_min=0.0,
+            q_central_diluent_ml_min=flow_for_half_life(170, 1.25),
+        )
+
+        result = simulate_hfim(
+            "central_only", system, None,
+            [DrugConfig("imipenem", 9.0, 1.25, dosing_mode="continuous infusion only")],
+            duration_h=24, dt_min=1,
+        )
+
+        # Without a setup drug there must be no placeholder compartment: no extra summary entry,
+        # no extra rows, and above all no 0.000 mg prep lines that would read as bench instructions.
+        self.assertEqual(sorted(result.summary), ["drug_preparation", "imipenem"])
+        self.assertEqual({row["drug"] for row in result.rows}, {"imipenem"})
+        self.assertEqual(
+            [row["component"] for row in result.summary["drug_preparation"]],
+            ["continuous infusion"],
+        )
+        self.assertTrue(all(row["extra_mg_l"] == 0.0 for row in result.rows))
+
+    def test_central_only_rejects_a_setup_drug_and_other_scenarios_require_one(self):
+        system = SystemConfig()
+
+        with self.assertRaises(ValueError):
+            simulate_hfim("q24_replacement", system, None, [], duration_h=24, dt_min=1)
+        with self.assertRaises(ValueError):
+            simulate_hfim("not_a_scenario", system, None, [], duration_h=24, dt_min=1)
+        # A setup drug passed alongside central_only is ignored rather than silently dosed.
+        result = simulate_hfim("central_only", system, FosfomycinConfig(central_stock_mg_ml=99.0), [], duration_h=24, dt_min=1)
+        self.assertEqual(sorted(result.summary), ["drug_preparation"])
+        self.assertEqual(result.summary["drug_preparation"], [])
+
+    def test_central_only_hits_each_target_for_a_shared_half_life_combination(self):
+        t_half = 1.25
+        system = SystemConfig(
+            central_bottle_ml=100, cartridge_ml=70, extra_volume_ml=1.0,
+            q_extra_to_central_ml_min=0.0, q_extra_diluent_ml_min=0.0,
+            q_central_diluent_ml_min=flow_for_half_life(170, t_half),
+        )
+        drugs = [
+            DrugConfig("imipenem", 9.0, t_half, dosing_mode="loading dose + continuous infusion",
+                       loading_target_concentration_mg_l=18.0, loading_duration_h=0.5),
+            DrugConfig("relebactam", 6.0, t_half, dosing_mode="loading dose + continuous infusion",
+                       loading_target_concentration_mg_l=12.0, loading_duration_h=0.5),
+            DrugConfig("meropenem", 16.0, t_half, dosing_mode="intermittent infusion only",
+                       intermittent_interval_h=8.0, intermittent_duration_h=0.5),
+        ]
+
+        result = simulate_hfim("central_only", system, None, drugs, duration_h=96, dt_min=1)
+
+        for drug in drugs:
+            window = [r for r in result.rows if r["drug"] == drug.name and r["time_h"] >= 72]
+            cavg = sum(r["central_mg_l"] for r in window) / len(window)
+            self.assertAlmostEqual(cavg, drug.target_concentration_mg_l, delta=0.05)
+
+    def test_intermittent_peak_trough_matches_the_simulated_profile(self):
+        t_half, target, interval_h, duration_h = 1.25, 16.0, 8.0, 0.5
+        system = SystemConfig(
+            central_bottle_ml=100, cartridge_ml=70, extra_volume_ml=1.0,
+            q_extra_to_central_ml_min=0.0, q_extra_diluent_ml_min=0.0,
+            q_central_diluent_ml_min=flow_for_half_life(170, t_half),
+        )
+        result = simulate_hfim(
+            "central_only", system, None,
+            [DrugConfig("meropenem", target, t_half, dosing_mode="intermittent infusion only",
+                        intermittent_interval_h=interval_h, intermittent_duration_h=duration_h)],
+            duration_h=96, dt_min=1,
+        )
+        window = [r for r in result.rows if r["drug"] == "meropenem" and r["time_h"] >= 72]
+
+        cmax, cmin = intermittent_peak_trough(target, t_half, interval_h, duration_h)
+
+        # The closed form drives the peak-shaping table, so it has to agree with the integrated ODE
+        # rather than just being internally consistent with itself.
+        self.assertAlmostEqual(cmax, max(r["central_mg_l"] for r in window), delta=0.5)
+        self.assertAlmostEqual(cmin, min(r["central_mg_l"] for r in window), delta=0.05)
+
+    def test_intermittent_peak_trough_flattens_as_the_interval_shortens(self):
+        peaks = [intermittent_peak_trough(16.0, 1.25, interval, 0.5)[0] for interval in (2, 3, 4, 6, 8, 12)]
+
+        self.assertEqual(peaks, sorted(peaks))
+        self.assertGreater(peaks[-1] / peaks[0], 3.0)
+        self.assertEqual(intermittent_peak_trough(0.0, 1.25, 8.0, 0.5), (0.0, 0.0))
 
     def test_intermediate_extra_drug_name_is_not_hard_coded_to_fosfomycin(self):
         result = simulate_hfim(

@@ -14,7 +14,8 @@ from hfim_simulator.app import (
     _figure_export_bytes,
     _loading_dose_default_for_target_type,
     _loading_target_default_mg_l,
-    _plot_setup_schematic,
+    _plot_one_half_life_apparatus,
+    _plot_two_half_life_apparatus,
     _preparation_destination_cards,
     _preparation_review_rows,
     _shared_central_half_life_from_widget_state,
@@ -369,65 +370,97 @@ class HfimAppLogicTest(unittest.TestCase):
 
         self.assertNotIn("5.897897", source)
 
-    def test_presentation_schematic_exports_editable_svg_text(self):
-        system_values = {
-            "Central": "100 mL",
-            "Cartridge": "70 mL",
-            "Extra": "241 mL",
-            "Extra to central": "0.167 mL/min",
-            "Extra diluent": "0 mL/min",
-            "Central diluent": "1.404 mL/min",
-            "Waste": "1.571 mL/min",
-            "Extra overflow": "0 mL/min while dosing",
-            "Reservoir interval": "q24h",
-            "Recirculation": "120 mL/min",
+    def _two_half_life_view(self, **overrides):
+        view = {
+            "title": "HFIM apparatus - 2 half life (central + extra)",
+            "subtitle": "fosfomycin shaped by central + extra",
+            "cartridge_volume": "70 mL", "central_volume": "100 mL", "extra_volume": "241 mL",
+            "waste_total": "15,838 mL", "central_diluent_total": "14,154 mL", "extra_diluent_total": "9,050 mL",
+            "recirculation": "120 mL/min", "waste_flow": "1.571 mL/min",
+            "extra_to_central_flow": "0.167 mL/min", "central_diluent_flow": "1.404 mL/min",
+            "extra_diluent_flow": "0.000 mL/min", "show_extra_diluent": False,
+            "central_injection_groups": [("fosfomycin q6h", ["32.453 mg in 6.0 mL", "5,408.8 µg/mL"])],
+            "extra_injection_groups": [("fosfomycin extra q24h", ["241.0 mL fill", "966.5 µg/mL"])],
         }
-        injection_values = {
-            "setup_central": ["central q6h infusion", "stock 5.4088 mg/mL", "6 mL over 1 h", "32.45 mg/dose"],
-            "central_other": ["imipenem LD 3.060 mg/0.50 h", "imipenem CI in Diluent Central"],
-            "central_other_drugs": ["imipenem", "relebactam"],
-            "central_diluent": ["prepare 2022 mL/q24h", "+10% = 2224 mL", "imipenem: 10.07 ug/mL, 20.36 mg"],
-            "extra": ["full compartment replacement", "stock 0.966477 mg/mL", "232.92 mg/replacement", "replace q24h"],
-            "setup_drug": "fosfomycin",
+        view.update(overrides)
+        return view
+
+    def _one_half_life_view(self, **overrides):
+        view = {
+            "title": "HFIM apparatus - 1 half life (central only)",
+            "subtitle": "Shared half-life 1.25 h",
+            "cartridge_volume": "70 mL", "central_volume": "100 mL",
+            "waste_total": "15,838 mL", "central_diluent_total": "15,838 mL",
+            "recirculation": "120 mL/min", "waste_flow": "1.571 mL/min", "central_diluent_flow": "1.571 mL/min",
+            "injection_groups": [("imipenem", ["loading dose 3.060 mg", "612.0 µg/mL"])],
         }
+        view.update(overrides)
+        return view
 
-        fig = _plot_setup_schematic(system_values, injection_values, "q24_replacement")
-        svg = _figure_export_bytes(fig, "svg")
-        png = _figure_export_bytes(fig, "png")
-
-        self.assertIn(b"<svg", svg[:200])
-        self.assertIn(b"HFIM system overview", svg)
-        self.assertIn(b"Protocol recipe", svg)
-        self.assertGreater(len(png), 100_000)
-
-    def test_schematic_uses_a_labeled_overflow_note_instead_of_bare_ellipsis(self):
-        system_values = {
-            "Central": "170 mL",
-            "Cartridge": "70 mL",
-            "Extra": "241 mL",
-            "Extra to central": "0.167 mL/min",
-            "Extra diluent": "0 mL/min",
-            "Central diluent": "1.404 mL/min",
-            "Waste": "1.571 mL/min",
-            "Extra overflow": "0 mL/min while dosing",
-            "Reservoir interval": "q24h",
-            "Recirculation": "120 mL/min",
+    def test_peak_shaping_rows_list_cmax_trade_off_only_for_intermittent_drugs(self):
+        drug_inputs = {
+            "meropenem": {"maintenance": "intermittent infusion"},
+            "imipenem": {"maintenance": "continuous infusion"},
         }
-        many_lines = [f"drug{i} CI in Diluent Central: {i}.000 mg" for i in range(20)]
-        injection_values = {
-            "setup_central": ["central q6h infusion", "stock 5.4088 mg/mL"],
-            "central_other": many_lines,
-            "central_other_drugs": [f"drug{i}" for i in range(20)],
-            "central_diluent": ["prepare 2022 mL/q24h"],
-            "extra": ["full compartment replacement"],
-            "setup_drug": "fosfomycin",
+        summary = {
+            "meropenem": {"target_concentration_mg_l": 16.0, "intermittent_interval_h": 8.0, "intermittent_duration_h": 0.5},
+            "imipenem": {"target_concentration_mg_l": 9.0},
         }
 
-        fig = _plot_setup_schematic(system_values, injection_values, "q24_replacement")
-        svg = _figure_export_bytes(fig, "svg")
+        rows = app_module._peak_shaping_rows(drug_inputs, summary, shared_half_life_h=1.25)
+
+        # Continuous infusion has no interval to trade off, so it must not appear at all.
+        self.assertEqual([row["Drug"] for row in rows], ["meropenem"])
+        self.assertEqual(rows[0]["Target Cavg"], "16.0 mg/L")
+        # The interval currently in use is flagged so the reader can see where they are on the curve.
+        self.assertTrue(rows[0]["q8h"].endswith("*"))
+        self.assertFalse(rows[0]["q6h"].endswith("*"))
+        # Shorter intervals flatten the peak at the same Cavg.
+        self.assertLess(float(rows[0]["q2h"].split(" / ")[0]), float(rows[0]["q12h"].split(" / ")[0]))
+
+    def test_apparatus_diagrams_export_editable_svg_text(self):
+        two_fig = _plot_two_half_life_apparatus(self._two_half_life_view())
+        one_fig = _plot_one_half_life_apparatus(self._one_half_life_view())
+        two_svg = _figure_export_bytes(two_fig, "svg")
+        one_svg = _figure_export_bytes(one_fig, "svg")
+
+        self.assertIn(b"<svg", two_svg[:200])
+        # svg.fonttype="none" keeps text as text, so labels stay editable in Illustrator/Inkscape.
+        self.assertIn(b"Hollow fiber cartridge", two_svg)
+        self.assertIn(b"Extra compartment", two_svg)
+        self.assertIn(b"Central compartment", one_svg)
+        self.assertNotIn(b"Extra compartment", one_svg)
+        self.assertGreater(len(_figure_export_bytes(one_fig, "png")), 50_000)
+
+    def test_one_half_life_diagram_omits_extra_compartment_plumbing(self):
+        svg = _figure_export_bytes(_plot_one_half_life_apparatus(self._one_half_life_view()), "svg")
+
+        for absent in (b"Extra compartment", b"Diluent Extra", b"Injected into extra"):
+            self.assertNotIn(absent, svg)
+        self.assertIn(b"Drug injection into central compartment", svg)
+
+    def test_apparatus_injection_band_names_hidden_drugs_instead_of_dropping_them(self):
+        groups = [(f"drug{i}", [f"{i}.000 mg in 5.0 mL"]) for i in range(6)]
+        svg = _figure_export_bytes(
+            _plot_one_half_life_apparatus(self._one_half_life_view(injection_groups=groups)), "svg"
+        )
 
         self.assertNotIn(b"...", svg)
-        self.assertIn(b"more (see Section 7)", svg)
+        self.assertIn(b"more drugs (see Section 7)", svg)
+
+    def test_curved_apparatus_tube_rejects_an_even_point_count(self):
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots()
+        try:
+            # A four-point route would silently mis-render as a Bezier chain, so it must raise
+            # rather than quietly drawing the wrong plumbing.
+            with self.assertRaises(ValueError):
+                app_module._apparatus_tube(ax, [(0, 0), (1, 0), (1, 1), (2, 1)])
+            app_module._apparatus_tube(ax, [(0, 0), (1, 0), (1, 1)])
+            app_module._apparatus_tube(ax, [(0, 0), (1, 1)])
+        finally:
+            plt.close(fig)
 
 
 if __name__ == "__main__":

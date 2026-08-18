@@ -15,18 +15,52 @@ from .pk import (
     average_intermittent_rate,
     flow_for_half_life,
     half_life_for_flow,
+    intermittent_peak_trough,
     simulate_hfim,
     solve_css_cmax_replacement,
 )
 from .store import SimulationStore
 
 
+def _render_global_styles(st) -> None:
+    st.markdown(
+        """
+        <style>
+        /* st.metric's default value font is fixed-size and clips long numbers with an invisible
+        ellipsis instead of wrapping. This app shows 6-decimal mg/mL concentrations that operators
+        weigh reagents against, so a clipped digit is a real dosing risk, not just a cosmetic issue. */
+        div[data-testid="stMetricValue"] {
+            font-size: 1.5rem;
+            white-space: normal;
+            overflow-wrap: break-word;
+            line-height: 1.25;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def main() -> None:
     import streamlit as st
 
     st.set_page_config(page_title="HFIM PK Simulator", layout="wide")
+    _render_global_styles(st)
+    st.navigation([
+        st.Page(_page_two_half_life, title="2 half life", url_path="two-half-life", default=True),
+        st.Page(_page_one_half_life, title="1 half life", url_path="one-half-life"),
+    ]).run()
+
+
+def _page_two_half_life() -> None:
+    import streamlit as st
+
     st.title("HFIM PK Simulator")
-    st.caption("Enter experimental conditions, simulate central and extra-compartment PK concentrations, and estimate how much drug to prepare.")
+    st.caption(
+        "Two different half-lives: one drug uses the central + extra compartment setup so its apparent "
+        "half-life can be longer than the shared central washout. Enter experimental conditions, simulate "
+        "central and extra-compartment PK concentrations, and estimate how much drug to prepare."
+    )
 
     st.subheader("1. Simulation setup")
     setup_cols = st.columns(4)
@@ -87,7 +121,9 @@ def main() -> None:
         auto_extra_flow = flow_for_half_life(extra_volume_ml, target_system_half_life)
         auto_flow_mode = _is_auto_flow_mode(flow_mode)
         q_extra_default = _qextra_default_for_scenario(scenario, flow_mode, auto_extra_flow)
-        qextra_label = "Extra to central fixed transfer (mL/min)" if scenario == "q24_replacement" else "Extra to central (mL/min)"
+        # Kept short and the same length in both scenarios so the six flow-setting columns don't wrap
+        # to different heights and misalign; the "fixed transfer" nuance lives in the help tooltip.
+        qextra_label = "Extra to central (mL/min)"
         q_extra_to_central = cols[3].number_input(
             qextra_label,
             min_value=0.0,
@@ -356,43 +392,41 @@ def main() -> None:
             ))
     result = simulate_hfim(scenario, system, fos, drugs, duration_h=duration_h, dt_min=dt_min)
 
-    setup_schematic_fig = _plot_setup_schematic(system_values={
-        "Central": f"{central_bottle_ml:g} mL",
-        "Cartridge": f"{cartridge_ml:g} mL",
-        "Extra": f"{extra_volume_ml:g} mL",
-        "Extra to central": f"{q_extra_to_central:g} mL/min",
-        "Extra diluent": f"{q_extra_diluent:g} mL/min",
-        "Central diluent": f"{q_central_diluent:g} mL/min",
-        "Waste": f"{q_extra_to_central + q_central_diluent:g} mL/min",
-        "Extra overflow": f"{fos.extra_infusion_ml_min:g} mL/min while dosing",
-        "Reservoir interval": f"q{reservoir_replacement_interval_h:g}h",
-        "Recirculation": f"{recirculation_ml_min:g} mL/min",
-    }, injection_values=_schematic_injection_values(drug_inputs, fos, scenario, result.summary), scenario=scenario)
-    st.image(_figure_export_bytes(setup_schematic_fig, "png", dpi=300), width="stretch")
-    export_cols = st.columns([1, 1, 1, 5])
-    export_cols[0].download_button(
-        "SVG",
-        data=_figure_export_bytes(setup_schematic_fig, "svg"),
-        file_name="hfim-setup-schematic.svg",
-        mime="image/svg+xml",
+    # One integrated apparatus diagram: vessels, flows and dosing instructions on a single canvas,
+    # so there is no separate recipe panel to cross-reference against the plumbing.
+    apparatus_fig = _plot_two_half_life_apparatus(_two_half_life_apparatus_view(
+        system, fos, drug_inputs, result.summary, scenario, duration_h, recirculation_ml_min, target_system_half_life,
+    ))
+    st.image(_figure_export_bytes(apparatus_fig, "png", dpi=300), width="stretch")
+    st.caption(
+        "Volumes on the waste and diluent bottles are totals for the whole run. Concentrations are shown "
+        "in µg/mL. The central compartment is magnetically stirred."
     )
-    export_cols[1].download_button(
-        "PDF",
-        data=_figure_export_bytes(setup_schematic_fig, "pdf"),
-        file_name="hfim-setup-schematic.pdf",
-        mime="application/pdf",
+    _render_schematic_export_buttons(st, apparatus_fig, "apparatus2", "hfim-apparatus-2-half-life")
+    st.dataframe(
+        _setup_overview_rows(central_bottle_ml, cartridge_ml, extra_volume_ml, q_extra_to_central, q_extra_diluent, q_central_diluent, scenario, fos),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Part": st.column_config.Column(width="small"),
+            "Current value": st.column_config.Column(width="small"),
+            "How to use": st.column_config.Column(width="large"),
+        },
     )
-    export_cols[2].download_button(
-        "PNG",
-        data=_figure_export_bytes(setup_schematic_fig, "png"),
-        file_name="hfim-setup-schematic.png",
-        mime="image/png",
-    )
-    st.dataframe(_setup_overview_rows(central_bottle_ml, cartridge_ml, extra_volume_ml, q_extra_to_central, q_extra_diluent, q_central_diluent, scenario, fos), width="stretch", hide_index=True)
     st.markdown("**System solution volumes**")
     st.dataframe(_solution_volume_rows(q_central_diluent, q_extra_diluent, scenario, duration_h), width="stretch", hide_index=True)
     st.markdown("**Drug injection plan**")
-    st.dataframe(_injection_plan_rows(drug_inputs, fos, scenario, setup_drug_name), width="stretch", hide_index=True)
+    st.dataframe(
+        _injection_plan_rows(drug_inputs, fos, scenario, setup_drug_name),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Drug": st.column_config.Column(width="small"),
+            "Target": st.column_config.Column(width="medium"),
+            "Half-life": st.column_config.Column(width="small"),
+            "Dosing plan": st.column_config.Column(width="large"),
+        },
+    )
 
     run_and_save = st.button("Run and save to SQLite")
     setup_summary = result.summary[setup_drug_name]
@@ -429,12 +463,29 @@ def main() -> None:
     review_rows = _preparation_review_rows(prep_rows, result.summary, system, fos, duration_h)
     st.markdown("**Final preparation review**")
     st.caption("Use this table as the bench checklist: each row tells you which drug goes into which dosing part, with required amount, 10% extra when applicable, and the amount to weigh.")
-    st.dataframe(review_rows, width="stretch", hide_index=True)
+    st.dataframe(
+        review_rows,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Drug": st.column_config.Column(width="small"),
+            "Add into": st.column_config.Column(width="medium"),
+            "Dosing part": st.column_config.Column(width="medium"),
+            "Frequency": st.column_config.Column(width="medium"),
+            "10% extra": st.column_config.Column(width="small"),
+            "Note": st.column_config.Column(width="large"),
+        },
+    )
 
     st.markdown("**Calculation details**")
     if setup_prep:
         st.markdown(f"**{setup_drug_name} central dosing**")
-        st.dataframe(setup_prep, width="stretch", hide_index=True)
+        st.dataframe(
+            setup_prep,
+            width="stretch",
+            hide_index=True,
+            column_config={"Note": st.column_config.Column(width="large")},
+        )
     if extra_replacement_prep:
         st.markdown(f"**{setup_drug_name} extra q24h replacement solution**")
         st.caption(
@@ -457,7 +508,12 @@ def main() -> None:
             f"{replacement_summary['total_drug_with_overfill_mg']:.1f} mg",
         )
         extra_solution_rows = _replacement_solution_rows(system, fos, duration_h)
-        st.dataframe(extra_solution_rows, width="stretch", hide_index=True)
+        st.dataframe(
+            extra_solution_rows,
+            width="stretch",
+            hide_index=True,
+            column_config={"How calculated": st.column_config.Column(width="large")},
+        )
     central_diluent_ci_rows = _central_diluent_reservoir_rows(result.summary, duration_h)
     if central_diluent_ci_rows:
         central_diluent_recipe = _central_diluent_reservoir_summary(result.summary, duration_h)
@@ -472,10 +528,20 @@ def main() -> None:
         recipe_cols[2].metric("Total to prepare q24h", central_diluent_recipe["prepared_volume_q24h"])
         recipe_cols[3].metric(f"Total to prepare {duration_h:g} h", central_diluent_recipe["prepared_volume_total"])
         st.caption(f"Number of q24h reservoirs = {central_diluent_recipe['replacements']}. The 10% extra is shown separately from the total prepared volume.")
-        st.dataframe(central_diluent_ci_rows, width="stretch", hide_index=True)
+        st.dataframe(
+            central_diluent_ci_rows,
+            width="stretch",
+            hide_index=True,
+            column_config={"Note": st.column_config.Column(width="large")},
+        )
     if other_prep:
         st.markdown(f"**{_prep_group_title(other_prep)}**")
-        st.dataframe(other_prep, width="stretch", hide_index=True)
+        st.dataframe(
+            other_prep,
+            width="stretch",
+            hide_index=True,
+            column_config={"Note": st.column_config.Column(width="large")},
+        )
 
     st.subheader("8. What this means")
     st.markdown(_interpretation_text(scenario, setup_drug_name, setup_summary, setup_target_auc, result.summary, [drug.name for drug in drugs]))
@@ -986,435 +1052,741 @@ def _extra_dosing_plan_label(scenario: str) -> str:
     return "no extra dosing"
 
 
-def _schematic_injection_values(
-    drug_inputs: dict[str, dict],
-    fos: FosfomycinConfig,
-    scenario: str,
-    summary: dict,
-) -> dict[str, list[str]]:
-    setup_drug_name = fos.drug_name
-    setup_central_lines = []
-    central_other_lines = []
-    central_diluent_lines = []
-    extra_lines = []
-    central_diluent_volume_ml = 0.0
-    ci_items = [
-        item
-        for name, item in summary.items()
-        if name != "drug_preparation"
-        and isinstance(item, dict)
-        and item.get("central_diluent_concentration_mg_ml") is not None
-    ]
-    if ci_items:
-        central_diluent_volume_ml = max(item.get("central_diluent_volume_per_24h_ml", 0.0) for item in ci_items)
-        central_diluent_lines.append(f"reservoir volume {central_diluent_volume_ml:.0f} mL/q24h")
-        central_diluent_lines.append(f"prepare +10% {central_diluent_volume_ml * 1.10:.0f} mL")
-    if setup_drug_name in drug_inputs:
-        dose_interval_h = fos.dosing_interval_min / 60
-        central_dose_volume_ml = fos.central_infusion_ml_min * fos.infusion_duration_min
-        central_daily_amount_mg = fos.central_dose_mg * 24 / dose_interval_h
-        central_daily_volume_ml = central_dose_volume_ml * 24 / dose_interval_h
-        setup_central_lines.extend([
-            f"q{dose_interval_h:g}h direct central infusion",
-            f"stock {fos.central_stock_mg_ml:g} mg/mL",
-            f"dose volume {central_dose_volume_ml:g} mL over {fos.infusion_duration_min / 60:g} h",
-            f"{fos.central_dose_mg:.2f} mg/dose",
-            f"24h prep {central_daily_volume_ml:.1f} mL; {central_daily_amount_mg:.2f} mg",
-        ])
-        if scenario == "overflow":
-            extra_dose_volume_ml = fos.extra_infusion_ml_min * fos.infusion_duration_min
-            extra_daily_amount_mg = fos.extra_dose_mg * 24 / dose_interval_h
-            extra_daily_volume_ml = extra_dose_volume_ml * 24 / dose_interval_h
-            extra_lines.extend([
-                f"q{dose_interval_h:g}h extra infusion",
-                f"stock {fos.extra_stock_mg_ml:g} mg/mL",
-                f"dose volume {extra_dose_volume_ml:g} mL over {fos.infusion_duration_min / 60:g} h",
-                f"{fos.extra_dose_mg:.2f} mg/dose",
-                f"24h prep {extra_daily_volume_ml:.1f} mL; {extra_daily_amount_mg:.2f} mg",
-            ])
-        elif scenario == "q24_replacement":
-            replacement_volume_ml = summary[setup_drug_name]["final_extra_volume_ml"]
-            replacement_amount_mg = fos.extra_stock_mg_ml * replacement_volume_ml
-            extra_lines.extend([
-                f"full extra replacement q{fos.reservoir_replacement_interval_h:g}h",
-                f"stock {fos.extra_stock_mg_ml:g} mg/mL",
-                f"fill volume {replacement_volume_ml:.0f} mL",
-                f"weigh {replacement_amount_mg:.2f} mg/replacement",
-                f"+10%: {replacement_volume_ml * 1.10:.1f} mL; {replacement_amount_mg * 1.10:.2f} mg",
-            ])
+# ---------------------------------------------------------------------------
+# HFIM apparatus schematic
+#
+# One integrated diagram per page: vessels, tubing, flow markers and dosing
+# instructions all live on the same canvas, so there is no separate recipe
+# panel to cross-reference. Semantic colours are shared with Section 7's cards:
+#   green = volume, blue = concentration, amber = flow / dose, ink = names.
+# ---------------------------------------------------------------------------
 
-    for name in drug_inputs:
-        if name == setup_drug_name:
+_APPARATUS = {
+    "ink": "#12203a",
+    "muted": "#5b6b85",
+    "volume": "#0f7a52",
+    "concentration": "#2456c7",
+    "rate": "#c2670a",
+    "inject": "#c2359b",
+    "tube": "#9fd9e8",
+    "tube_dark": "#5d9fb5",
+    "glass": "#e8f6fb",
+    "glass_edge": "#7fb3c6",
+    "glass_shine": "#fbfeff",
+    "cap": "#4c56b0",
+    "cap_dark": "#333c8c",
+    "liquid": "#22a06b",
+    "liquid_fill": "#9fdce3",
+    "cartridge": "#2f6fe0",
+    "cartridge_dark": "#1d4ba8",
+    "cartridge_light": "#8fb6f2",
+    "ecs_fill": "#dbe9fb",
+    "ecs_edge": "#b9d2f3",
+    "ecs_text": "#2b4a7d",
+    "marker": "#f5a524",
+    "marker_edge": "#c2670a",
+    "pump_body": "#e7ecf4",
+    "pump_edge": "#5b6b85",
+    "paper": "#ffffff",
+    "panel": "#f7fafc",
+    "panel_edge": "#dbe4ef",
+}
+
+
+def _apparatus_bottle(ax, x, y, w=0.92, h=1.45, fill_level=0.55, label=None, volume=None, stir_bar=False, zorder=3):
+    """A lab media bottle: squared body, tapered shoulder, short neck and screw cap.
+
+    Built from a real bottle silhouette (body -> shoulder -> neck -> cap) with a drop shadow and a
+    layered liquid fill, rather than a plain rounded rectangle, so the diagram reads as apparatus.
+    """
+    from matplotlib.patches import FancyBboxPatch, Polygon, Rectangle
+    from matplotlib.patheffects import withSimplePatchShadow
+
+    c = _APPARATUS
+    body_h = h * 0.68
+    body_y = y - h / 2
+    body_top = body_y + body_h
+    shoulder_h = h * 0.11
+    neck_w, neck_h = w * 0.30, h * 0.07
+    cap_w, cap_h = w * 0.40, h * 0.12
+    neck_top = body_top + shoulder_h + neck_h
+    shadow = withSimplePatchShadow(offset=(1.7, -1.7), shadow_rgbFace="#16243c", alpha=0.14)
+
+    body = FancyBboxPatch(
+        (x - w / 2, body_y), w, body_h,
+        boxstyle="round,pad=0,rounding_size=0.12",
+        linewidth=1.15, edgecolor=c["glass_edge"], facecolor=c["glass"], zorder=zorder,
+    )
+    body.set_path_effects([shadow])
+    ax.add_patch(body)
+
+    # Layered fill: darker at the base, lighter at the surface, which reads as liquid depth.
+    usable = body_h - 0.12
+    liquid_h = max(usable * fill_level, 0.07)
+    for frac, alpha in ((1.00, 0.55), (0.62, 0.30), (0.28, 0.28)):
+        ax.add_patch(FancyBboxPatch(
+            (x - w / 2 + 0.055, body_y + 0.055), w - 0.11, max(liquid_h * frac, 0.05),
+            boxstyle="round,pad=0,rounding_size=0.09",
+            linewidth=0, facecolor=c["liquid_fill"], alpha=alpha, zorder=zorder + 0.1,
+        ))
+    ax.plot(
+        [x - w / 2 + 0.075, x + w / 2 - 0.075], [body_y + 0.055 + liquid_h] * 2,
+        color=c["liquid"], linewidth=1.6, solid_capstyle="round", zorder=zorder + 0.2,
+    )
+
+    ax.add_patch(Polygon(
+        [(x - w / 2 + 0.02, body_top), (x + w / 2 - 0.02, body_top),
+         (x + neck_w / 2, body_top + shoulder_h), (x - neck_w / 2, body_top + shoulder_h)],
+        closed=True, linewidth=1.1, edgecolor=c["glass_edge"], facecolor=c["glass"], zorder=zorder + 0.15,
+    ))
+    ax.add_patch(Rectangle(
+        (x - neck_w / 2, body_top + shoulder_h - 0.01), neck_w, neck_h + 0.02,
+        linewidth=1.1, edgecolor=c["glass_edge"], facecolor=c["glass"], zorder=zorder + 0.15,
+    ))
+    cap = FancyBboxPatch(
+        (x - cap_w / 2, neck_top - 0.01), cap_w, cap_h,
+        boxstyle="round,pad=0,rounding_size=0.045",
+        linewidth=1.0, edgecolor=c["cap_dark"], facecolor=c["cap"], zorder=zorder + 0.3,
+    )
+    cap.set_path_effects([shadow])
+    ax.add_patch(cap)
+    for i in range(4):
+        rx = x - cap_w / 2 + cap_w * (0.2 + i * 0.2)
+        ax.plot([rx, rx], [neck_top + 0.015, neck_top + cap_h - 0.035], color=c["cap_dark"], linewidth=0.7, alpha=0.75, zorder=zorder + 0.4)
+
+    ax.plot(
+        [x - w / 2 + 0.14, x - w / 2 + 0.14], [body_y + 0.20, body_top - 0.18],
+        color=c["glass_shine"], linewidth=2.4, alpha=0.85, solid_capstyle="round", zorder=zorder + 0.25,
+    )
+    if stir_bar:
+        # Inside the vessel rather than as a separate box underneath, which would collide with the
+        # vessel's own caption.
+        ax.add_patch(FancyBboxPatch(
+            (x - w * 0.19, body_y + 0.10), w * 0.38, 0.09,
+            boxstyle="round,pad=0,rounding_size=0.035",
+            linewidth=0.8, edgecolor="#5b6b85", facecolor="#c3ccd8", zorder=zorder + 0.5,
+        ))
+        ax.text(x, body_y + 0.31, "stirred", ha="center", va="bottom", fontsize=6.6, style="italic", color=c["muted"], zorder=zorder + 0.5)
+
+    text_y = body_y - 0.14
+    if label:
+        ax.text(x, text_y, label, ha="center", va="top", fontsize=9.6, weight="bold", color=c["ink"], zorder=8)
+        text_y -= 0.25
+    if volume:
+        ax.text(x, text_y, volume, ha="center", va="top", fontsize=8.8, color=c["volume"], zorder=8)
+    return x, neck_top + cap_h
+
+
+def _apparatus_cartridge(ax, x, y, w=3.0, h=0.52, label=None, volume=None, label_side="right", zorder=4):
+    """Hollow-fibre cartridge drawn as a horizontal barrel with end ports and visible fibres."""
+    from matplotlib.patches import Circle, FancyBboxPatch, Rectangle
+
+    from matplotlib.patheffects import withSimplePatchShadow
+
+    c = _APPARATUS
+    # Outer shell = extracapillary space, where the bacteria sit; the fibre bundle inside is the
+    # intracapillary space the drug is pumped through. Showing both is the point of the cartridge.
+    shell = FancyBboxPatch(
+        (x - w / 2, y - h / 2),
+        w,
+        h,
+        boxstyle="round,pad=0,rounding_size=0.22",
+        linewidth=1.3,
+        edgecolor=c["cartridge_dark"],
+        facecolor=c["ecs_fill"],
+        zorder=zorder,
+    )
+    shell.set_path_effects([withSimplePatchShadow(offset=(1.8, -1.8), shadow_rgbFace="#16243c", alpha=0.16)])
+    ax.add_patch(shell)
+    lumen_h = h * 0.52
+    ax.add_patch(FancyBboxPatch(
+        (x - w * 0.40, y - lumen_h / 2),
+        w * 0.80,
+        lumen_h,
+        boxstyle="round,pad=0,rounding_size=0.10",
+        linewidth=0.9,
+        edgecolor=c["cartridge_dark"],
+        facecolor=c["cartridge"],
+        zorder=zorder + 0.1,
+    ))
+    for i in range(16):
+        fx = x - w * 0.375 + i * (w * 0.75 / 15)
+        ax.plot([fx, fx], [y - lumen_h * 0.40, y + lumen_h * 0.40], color=c["cartridge_light"], linewidth=0.7, alpha=0.85, zorder=zorder + 0.2)
+    ax.add_patch(Rectangle((x - w * 0.40, y + lumen_h * 0.10), w * 0.80, lumen_h * 0.12, facecolor=c["cartridge_light"], edgecolor="none", alpha=0.5, zorder=zorder + 0.25))
+    for side in (-1, 1):
+        ax.add_patch(Rectangle((x + side * w * 0.415 - 0.035, y - h * 0.30), 0.07, h * 0.60, facecolor=c["cartridge_light"], edgecolor=c["cartridge_dark"], linewidth=0.8, zorder=zorder + 0.15))
+        ax.add_patch(Circle((x + side * (w / 2 + 0.07), y), radius=0.11, facecolor=c["cartridge_light"], edgecolor=c["cartridge_dark"], linewidth=1.0, zorder=zorder + 0.2))
+    # Sampling port on the ECS: where CFU samples are actually drawn from.
+    ax.add_patch(Rectangle((x - 0.055, y + h / 2), 0.11, 0.17, facecolor=c["ecs_edge"], edgecolor=c["cartridge_dark"], linewidth=0.8, zorder=zorder + 0.2))
+    ax.add_patch(Circle((x, y + h / 2 + 0.20), radius=0.075, facecolor=c["inject"], edgecolor="none", zorder=zorder + 0.3))
+    ax.text(x + 0.16, y + h / 2 + 0.20, "sampling port", ha="left", va="center", fontsize=6.6, style="italic", color=c["muted"], zorder=zorder + 0.3)
+    if label_side == "right":
+        # Beside the barrel, not above it, so a tall page title never collides with the label.
+        # The ECS caption also lives out here: inside the shell the fibre bundle covers it.
+        text_x = x + w / 2 + 0.30
+        if label:
+            ax.text(text_x, y + 0.24, label, ha="left", va="bottom", fontsize=9.6, weight="bold", color=c["ink"], zorder=8)
+        if volume:
+            ax.text(text_x, y + 0.04, volume, ha="left", va="bottom", fontsize=8.8, color=c["volume"], zorder=8)
+        ax.text(text_x, y - 0.14, "bacteria held in ECS", ha="left", va="top", fontsize=7.4, style="italic", color=c["ecs_text"], zorder=8)
+        return
+    text_y = y + h / 2 + 0.20
+    if label:
+        ax.text(x, text_y, label, ha="center", va="bottom", fontsize=9.6, weight="bold", color=c["ink"], zorder=8)
+        text_y += 0.24
+    if volume:
+        ax.text(x, text_y, volume, ha="center", va="bottom", fontsize=8.8, color=c["volume"], zorder=8)
+
+
+def _apparatus_injection_band(ax, groups, x_start, y_top, width, columns=3, max_lines=8, header=None):
+    """Lay dosing instructions out as a row of per-drug blocks under the apparatus.
+
+    Keeping them in their own band means the block list grows sideways with drug count instead of
+    running down into the vessel captions. The header names the destination, so a block sitting
+    below the waste bottle is not misread as belonging to it.
+    """
+    block_y = y_top
+    if header:
+        ax.text(x_start, y_top, header, ha="left", va="top", fontsize=9.4, weight="bold", color=_APPARATUS["inject"])
+        block_y = y_top - 0.32
+    for index, (title, lines) in enumerate(groups[: columns]):
+        _apparatus_injection_block(ax, x_start + index * width, block_y, title, lines, max_lines=max_lines)
+    if len(groups) > columns:
+        ax.text(
+            x_start,
+            block_y - 0.26 - max_lines * 0.21,
+            f"+{len(groups) - columns} more drugs (see Section 7)",
+            ha="left",
+            va="top",
+            fontsize=7.6,
+            color=_APPARATUS["muted"],
+        )
+
+
+TUBE_FAST = 5.2
+TUBE_SLOW = 2.6
+
+
+def _apparatus_tube(ax, points, zorder=2, linewidth=TUBE_SLOW):
+    """Tubing drawn as an outer casing plus a lighter inner lumen.
+
+    Line width encodes flow magnitude: the cartridge recirculation loop moves roughly two orders of
+    magnitude more volume than the PK diluent/waste lines, and drawing every tube identically hides
+    that. Use TUBE_FAST for the recirculation loop and TUBE_SLOW for the PK flows.
+
+    Two points draw a straight run. More than two points are read as a quadratic Bezier chain -
+    after the start point they alternate (control, end), so the count must be odd. Keeping the
+    rule explicit avoids silently mis-rendering a route when a caller adds a waypoint.
+    """
+    from matplotlib.path import Path
+    from matplotlib.patches import PathPatch
+
+    c = _APPARATUS
+    if len(points) < 2:
+        raise ValueError("a tube needs at least two points")
+    if len(points) == 2:
+        codes = [Path.MOVETO, Path.LINETO]
+    elif len(points) % 2 == 1:
+        codes = [Path.MOVETO] + [Path.CURVE3] * (len(points) - 1)
+    else:
+        raise ValueError("a curved tube needs an odd number of points: start then (control, end) pairs")
+    path = Path(list(points), codes)
+    for width, color in ((linewidth + 1.1, c["tube_dark"]), (linewidth, c["tube"])):
+        ax.add_patch(PathPatch(path, facecolor="none", edgecolor=color, linewidth=width, capstyle="round", joinstyle="round", zorder=zorder))
+        zorder += 0.1
+
+
+def _apparatus_flow_arrow(ax, x, y, direction, size=0.13, zorder=6.5):
+    """Small solid arrowhead sitting on a tube to show which way the fluid moves."""
+    from matplotlib.patches import Polygon
+
+    dx, dy = {"left": (-1, 0), "right": (1, 0), "up": (0, 1), "down": (0, -1)}[direction]
+    px, py = -dy, dx
+    tip = (x + dx * size, y + dy * size)
+    left = (x - dx * size * 0.5 + px * size * 0.78, y - dy * size * 0.5 + py * size * 0.78)
+    right = (x - dx * size * 0.5 - px * size * 0.78, y - dy * size * 0.5 - py * size * 0.78)
+    ax.add_patch(Polygon([tip, left, right], closed=True, facecolor=_APPARATUS["rate"], edgecolor="none", zorder=zorder))
+
+
+def _apparatus_pump(ax, x, y, rate=None, radius=0.30, zorder=7, label_offset=(0.0, -0.50), label_ha="center"):
+    """Peristaltic pump head: housing ring with three rollers, the way HFIM circuits are drawn.
+
+    Real hollow-fibre rigs move fluid with roller pumps, so drawing the pump rather than an abstract
+    arrow box makes the diagram read as apparatus instead of a flow chart.
+    """
+    import math as _math
+    from matplotlib.patches import Circle
+    from matplotlib.patheffects import withSimplePatchShadow
+
+    c = _APPARATUS
+    housing = Circle((x, y), radius, facecolor=c["pump_body"], edgecolor=c["pump_edge"], linewidth=1.3, zorder=zorder)
+    housing.set_path_effects([withSimplePatchShadow(offset=(1.4, -1.4), shadow_rgbFace="#16243c", alpha=0.15)])
+    ax.add_patch(housing)
+    ax.add_patch(Circle((x, y), radius * 0.70, facecolor=c["paper"], edgecolor=c["pump_edge"], linewidth=0.8, zorder=zorder + 0.1))
+    for index in range(3):
+        angle = _math.radians(index * 120 + 30)
+        ax.add_patch(Circle(
+            (x + radius * 0.46 * _math.cos(angle), y + radius * 0.46 * _math.sin(angle)),
+            radius * 0.19,
+            facecolor=c["marker"],
+            edgecolor=c["marker_edge"],
+            linewidth=0.7,
+            zorder=zorder + 0.2,
+        ))
+    ax.add_patch(Circle((x, y), radius * 0.13, facecolor=c["pump_edge"], edgecolor="none", zorder=zorder + 0.3))
+    if rate:
+        ax.text(
+            x + label_offset[0],
+            y + label_offset[1],
+            rate,
+            ha=label_ha,
+            va="center",
+            fontsize=8.0,
+            color=c["rate"],
+            zorder=zorder + 1,
+            bbox={"facecolor": c["paper"], "edgecolor": "none", "pad": 1.4, "alpha": 0.92},
+        )
+
+
+def _apparatus_injection_port(ax, x, y, angle_deg=0.0, scale=1.0, zorder=6):
+    """Septum injection port on a vessel shoulder, drawn in the injection accent colour."""
+    from matplotlib.patches import Circle, FancyBboxPatch
+    from matplotlib.transforms import Affine2D
+
+    c = _APPARATUS
+    transform = Affine2D().rotate_deg(angle_deg).translate(x, y) + ax.transData
+    ax.add_patch(FancyBboxPatch(
+        (0.0, -0.09 * scale),
+        0.20 * scale,
+        0.18 * scale,
+        boxstyle="round,pad=0,rounding_size=0.03",
+        linewidth=0.9,
+        edgecolor=c["inject"],
+        facecolor="#fbe6f4",
+        transform=transform,
+        zorder=zorder,
+    ))
+    ax.add_patch(Circle((0.20 * scale, 0.0), 0.065 * scale, facecolor=c["inject"], edgecolor="none", transform=transform, zorder=zorder + 0.1))
+
+
+def _apparatus_syringe(ax, tip, angle_deg=0.0, scale=1.0, zorder=7):
+    """Syringe anchored by its needle TIP, with the barrel trailing back along angle_deg.
+
+    Anchoring on the tip means callers place the needle exactly on the injection port instead of
+    positioning the barrel and hoping the needle lands somewhere sensible.
+    """
+    from matplotlib.patches import FancyBboxPatch
+    from matplotlib.transforms import Affine2D
+
+    transform = Affine2D().rotate_deg(angle_deg).translate(*tip) + ax.transData
+    needle = 0.30 * scale
+    hub_w = 0.10 * scale
+    barrel_w, barrel_h = 0.62 * scale, 0.24 * scale
+    barrel_x = -(needle + hub_w + barrel_w)
+
+    ax.plot([0.0, -needle], [0.0, 0.0], color="#78829a", linewidth=1.3, solid_capstyle="round", transform=transform, zorder=zorder)
+    ax.add_patch(FancyBboxPatch(
+        (-(needle + hub_w), -0.055 * scale), hub_w, 0.11 * scale,
+        boxstyle="round,pad=0,rounding_size=0.02", linewidth=0.8,
+        edgecolor="#78829a", facecolor="#b9c2d0", transform=transform, zorder=zorder,
+    ))
+    ax.add_patch(FancyBboxPatch(
+        (barrel_x, -barrel_h / 2), barrel_w, barrel_h,
+        boxstyle="round,pad=0,rounding_size=0.035", linewidth=0.9,
+        edgecolor="#78829a", facecolor="#eef2f7", transform=transform, zorder=zorder,
+    ))
+    # Graduation ticks and a filled charge, so it reads as a loaded syringe rather than a blank box.
+    ax.add_patch(FancyBboxPatch(
+        (barrel_x + barrel_w * 0.10, -barrel_h / 2 + 0.025 * scale), barrel_w * 0.52, barrel_h - 0.05 * scale,
+        boxstyle="round,pad=0,rounding_size=0.02", linewidth=0, facecolor="#d7e9f5", transform=transform, zorder=zorder + 0.1,
+    ))
+    for index in range(4):
+        tick_x = barrel_x + barrel_w * (0.24 + index * 0.17)
+        ax.plot([tick_x, tick_x], [-barrel_h * 0.20, barrel_h * 0.20], color="#9aa4b6", linewidth=0.55, transform=transform, zorder=zorder + 0.2)
+    ax.add_patch(FancyBboxPatch(
+        (barrel_x - 0.16 * scale, -barrel_h * 0.86), 0.07 * scale, barrel_h * 1.72,
+        boxstyle="round,pad=0,rounding_size=0.02", linewidth=0.8,
+        edgecolor="#78829a", facecolor="#c3ccd8", transform=transform, zorder=zorder,
+    ))
+    ax.plot([barrel_x, barrel_x - 0.16 * scale], [0.0, 0.0], color="#9aa4b6", linewidth=1.1, transform=transform, zorder=zorder)
+
+
+def _apparatus_injection_block(ax, x, y, title, lines, ha="left", zorder=8, max_lines=9):
+    """Dosing instructions rendered at the injection site, colour-coded per value type."""
+    c = _APPARATUS
+    ax.text(x, y, title, ha=ha, va="top", fontsize=9.0, weight="bold", color=c["ink"], zorder=zorder)
+    line_y = y - 0.26
+    if len(lines) > max_lines:
+        hidden = len(lines) - (max_lines - 1)
+        shown = list(lines[: max_lines - 1]) + [f"+{hidden} more (see Section 7)"]
+    else:
+        shown = list(lines)
+    for text in shown:
+        ax.text(x, line_y, text, ha=ha, va="top", fontsize=7.6, color=_apparatus_value_color(text), zorder=zorder)
+        line_y -= 0.21
+    return line_y
+
+
+def _apparatus_value_color(text: str) -> str:
+    c = _APPARATUS
+    lowered = text.lower()
+    if "µg/ml" in lowered or "ug/ml" in lowered or "mg/ml" in lowered:
+        return c["concentration"]
+    if "ml/min" in lowered or "ml/h" in lowered or "mg/dose" in lowered or "weigh" in lowered or "mg/q" in lowered:
+        return c["rate"]
+    if lowered.strip().endswith("ml") or " ml " in lowered or "volume" in lowered:
+        return c["volume"]
+    if "every" in lowered or "q24h" in lowered or "continuous" in lowered:
+        return c["muted"]
+    return c["muted"]
+
+
+def _apparatus_legend(ax, x, y, w=3.3, h=1.14, zorder=5):
+    from matplotlib.patches import FancyBboxPatch, Rectangle
+
+    c = _APPARATUS
+    ax.add_patch(FancyBboxPatch(
+        (x, y),
+        w,
+        h,
+        boxstyle="round,pad=0,rounding_size=0.06",
+        linewidth=0.9,
+        edgecolor=c["panel_edge"],
+        facecolor=c["paper"],
+        zorder=zorder,
+    ))
+    items = [("Volume", c["volume"]), ("Concentration", c["concentration"]), ("Flow / dose", c["rate"]), ("Injection", c["inject"])]
+    for index, (label, color) in enumerate(items):
+        ix = x + 0.16 + (index % 2) * (w / 2)
+        iy = y + h - 0.24 - (index // 2) * 0.27
+        ax.add_patch(Rectangle((ix, iy - 0.06), 0.13, 0.13, facecolor=color, edgecolor="none", zorder=zorder + 1))
+        ax.text(ix + 0.20, iy, label, ha="left", va="center", fontsize=7.4, color=c["muted"], zorder=zorder + 1)
+    # Tube bore is a real encoding, not decoration, so the key has to spell it out.
+    for offset, width, text in ((0.34, TUBE_FAST, "recirculation loop"), (0.13, TUBE_SLOW, "PK flows - width = flow")):
+        key_y = y + offset
+        ax.plot([x + 0.18, x + 0.56], [key_y, key_y], color=c["tube"], linewidth=width, solid_capstyle="round", zorder=zorder + 1)
+        ax.text(x + 0.66, key_y, text, ha="left", va="center", fontsize=6.9, color=c["muted"], zorder=zorder + 1)
+
+
+def _fmt_ug_per_ml(mg_per_ml: float) -> str:
+    """Concentrations read better in ug/mL for the low values this app produces."""
+    return f"{mg_per_ml * 1000:,.1f} µg/mL"
+
+
+def _apparatus_manifold_route(ax, start, manifold_y, end, marker_direction, rate, inset=0.70, marker_t=0.5):
+    """Route tubing from one bottle cap up to a shared overhead manifold, across, then down into another cap.
+
+    Real bottles are plumbed through their caps, so tubing has to travel above the vessels rather
+    than through them. Drawn as rise + straight run + descent so the flow marker always lands on the
+    straight section, where it stays readable.
+    """
+    sx, sy = start
+    ex, ey = end
+    going_right = ex > sx
+    lead_x = sx + (inset if going_right else -inset)
+    tail_x = ex + (-inset if going_right else inset)
+    _apparatus_tube(ax, [(sx, sy), (sx, manifold_y), (lead_x, manifold_y)])
+    _apparatus_tube(ax, [(lead_x, manifold_y), (tail_x, manifold_y)])
+    _apparatus_tube(ax, [(tail_x, manifold_y), (ex, manifold_y), (ex, ey)])
+    pump_x = lead_x + (tail_x - lead_x) * marker_t
+    _apparatus_pump(ax, pump_x, manifold_y, rate)
+    arrow_x = pump_x + (tail_x - lead_x) * 0.26
+    _apparatus_flow_arrow(ax, arrow_x, manifold_y, marker_direction)
+
+
+def _new_apparatus_figure(width, height, xlim, ylim, dpi=200):
+    import matplotlib.pyplot as plt
+
+    _configure_schematic_fonts()
+    fig, ax = plt.subplots(figsize=(width, height), dpi=dpi)
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    fig.patch.set_facecolor(_APPARATUS["paper"])
+    ax.set_facecolor(_APPARATUS["paper"])
+    return fig, ax
+
+
+def _plot_one_half_life_apparatus(view: dict):
+    """Central-only apparatus: cartridge loop, central bottle, waste, and one central diluent.
+
+    No extra compartment exists in this setup, so the layout is deliberately narrower than the
+    two-half-life diagram rather than leaving an empty gap where the extra bottle used to be.
+    """
+    c = _APPARATUS
+    fig, ax = _new_apparatus_figure(12.4, 8.4, (0, 12.4), (0, 8.4))
+
+    central_x, bottle_y = 5.40, 3.95
+    waste_x, diluent_x = 1.75, 9.05
+    cartridge_y, manifold_y = 6.70, 5.45
+    central_cap, side_cap = bottle_y + 0.80, bottle_y + 0.74
+
+    # Cartridge recirculation loop, plumbed through the central cap on both sides.
+    _apparatus_tube(ax, [(central_x - 0.26, central_cap), (central_x - 0.26, cartridge_y), (central_x - 1.52, cartridge_y)], linewidth=TUBE_FAST)
+    _apparatus_tube(ax, [(central_x + 1.52, cartridge_y), (central_x + 0.26, cartridge_y), (central_x + 0.26, central_cap)], linewidth=TUBE_FAST)
+    _apparatus_cartridge(ax, central_x, cartridge_y, w=2.9, h=0.62, label="Hollow fiber cartridge", volume=view["cartridge_volume"])
+    _apparatus_pump(ax, central_x - 0.26, cartridge_y - 0.92, view["recirculation"], label_offset=(-0.52, 0.0), label_ha="right")
+    _apparatus_flow_arrow(ax, central_x - 0.26, cartridge_y - 0.52, "up", size=0.17)
+
+    _apparatus_manifold_route(ax, (central_x - 0.46, central_cap), manifold_y, (waste_x, side_cap), "left", view["waste_flow"])
+    _apparatus_manifold_route(ax, (diluent_x, side_cap), manifold_y, (central_x + 0.46, central_cap), "left", view["central_diluent_flow"])
+
+    _apparatus_bottle(ax, central_x, bottle_y, w=1.30, h=1.72, fill_level=0.62, label="Central compartment", volume=view["central_volume"], stir_bar=True)
+    _apparatus_bottle(ax, waste_x, bottle_y, w=1.12, h=1.60, fill_level=0.24, label="Waste", volume=view["waste_total"])
+    _apparatus_bottle(ax, diluent_x, bottle_y, w=1.12, h=1.60, fill_level=0.68, label="Diluent Central", volume=view["central_diluent_total"])
+
+    # Needle tip lands on a septum port on the central bottle's shoulder, clear of all tubing.
+    port_x, port_y = central_x - 0.65, bottle_y + 0.30
+    _apparatus_injection_port(ax, port_x, port_y, angle_deg=180.0, scale=1.18)
+    _apparatus_syringe(ax, (port_x - 0.21, port_y), angle_deg=0.0, scale=1.18)
+    _apparatus_injection_band(
+        ax, view["injection_groups"], 0.55, 2.35, width=4.0, columns=3, max_lines=8,
+        header="Drug injection into central compartment",
+    )
+
+    ax.text(0.55, 8.22, view["title"], ha="left", va="top", fontsize=13.2, weight="bold", color=c["ink"])
+    ax.text(0.55, 7.86, view["subtitle"], ha="left", va="top", fontsize=8.6, color=c["muted"])
+    _apparatus_legend(ax, 8.65, 7.16, w=3.35, h=1.14)
+    return fig
+
+
+def _plot_two_half_life_apparatus(view: dict):
+    """Central + extra apparatus, including the extra compartment and its diluent reservoir."""
+    c = _APPARATUS
+    fig, ax = _new_apparatus_figure(13.8, 9.8, (0, 13.8), (0, 9.8))
+
+    central_x, bottle_y = 5.05, 5.90
+    waste_x, extra_x, diluent_extra_x = 1.60, 8.50, 11.90
+    # Sits in the horizontal gap between the central and extra captions, and feeds the central
+    # bottle's side rather than its base, so neither the riser nor its pump lands on a caption.
+    diluent_central_x, diluent_central_y = 6.75, 3.05
+    cartridge_y, manifold_y = 8.30, 7.30
+    central_cap, side_cap = bottle_y + 0.80, bottle_y + 0.74
+    extra_cap = bottle_y + 0.77
+
+    _apparatus_tube(ax, [(central_x - 0.26, central_cap), (central_x - 0.26, cartridge_y), (central_x - 1.52, cartridge_y)], linewidth=TUBE_FAST)
+    _apparatus_tube(ax, [(central_x + 1.52, cartridge_y), (central_x + 0.26, cartridge_y), (central_x + 0.26, central_cap)], linewidth=TUBE_FAST)
+    _apparatus_cartridge(ax, central_x, cartridge_y, w=2.9, h=0.62, label="Hollow fiber cartridge", volume=view["cartridge_volume"])
+    _apparatus_pump(ax, central_x - 0.26, cartridge_y - 0.92, view["recirculation"], label_offset=(-0.52, 0.0), label_ha="right")
+    _apparatus_flow_arrow(ax, central_x - 0.26, cartridge_y - 0.52, "up", size=0.17)
+
+    _apparatus_manifold_route(ax, (central_x - 0.46, central_cap), manifold_y, (waste_x, side_cap), "left", view["waste_flow"])
+    _apparatus_manifold_route(ax, (extra_x, extra_cap), manifold_y, (central_x + 0.46, central_cap), "left", view["extra_to_central_flow"])
+
+    _apparatus_tube(ax, [(diluent_central_x, diluent_central_y + 0.78), (diluent_central_x, bottle_y - 0.55), (central_x + 0.65, bottle_y - 0.55)])
+    # Label goes above this pump: a side label hits "Extra compartment" and a label below lands on
+    # the Diluent Central cap, since this riser is the shortest run on the diagram.
+    diluent_pump_y = (diluent_central_y + bottle_y) / 2 - 0.03
+    _apparatus_pump(ax, diluent_central_x, diluent_pump_y, view["central_diluent_flow"], label_offset=(0.0, 0.52), label_ha="center")
+    _apparatus_flow_arrow(ax, diluent_central_x, diluent_pump_y - 0.47, "up")
+
+    if view["show_extra_diluent"]:
+        _apparatus_manifold_route(ax, (diluent_extra_x, side_cap), manifold_y, (extra_x + 0.36, extra_cap), "left", view["extra_diluent_flow"], inset=0.55)
+        _apparatus_bottle(ax, diluent_extra_x, bottle_y, w=1.12, h=1.60, fill_level=0.68, label="Diluent Extra", volume=view["extra_diluent_total"])
+
+    _apparatus_bottle(ax, central_x, bottle_y, w=1.30, h=1.72, fill_level=0.62, label="Central compartment", volume=view["central_volume"], stir_bar=True)
+    _apparatus_bottle(ax, waste_x, bottle_y, w=1.12, h=1.60, fill_level=0.24, label="Waste", volume=view["waste_total"])
+    _apparatus_bottle(ax, extra_x, bottle_y, w=1.18, h=1.64, fill_level=0.58, label="Extra compartment", volume=view["extra_volume"])
+    _apparatus_bottle(ax, diluent_central_x, diluent_central_y, w=1.08, h=1.52, fill_level=0.68, label="Diluent Central", volume=view["central_diluent_total"])
+
+    central_port = (central_x - 0.65, bottle_y + 0.30)
+    _apparatus_injection_port(ax, *central_port, angle_deg=180.0, scale=1.18)
+    _apparatus_syringe(ax, (central_port[0] - 0.21, central_port[1]), angle_deg=0.0, scale=1.18)
+    _apparatus_injection_band(
+        ax, view["central_injection_groups"], 0.55, 1.75, width=2.55, columns=2, max_lines=6,
+        header="Injected into central",
+    )
+
+    extra_port = (extra_x + 0.59, bottle_y + 0.30)
+    _apparatus_injection_port(ax, *extra_port, angle_deg=0.0, scale=1.18)
+    _apparatus_syringe(ax, (extra_port[0] + 0.21, extra_port[1]), angle_deg=180.0, scale=1.18)
+    _apparatus_injection_band(
+        ax, view["extra_injection_groups"], 7.70, 1.75, width=2.90, columns=2, max_lines=6,
+        header="Injected into extra",
+    )
+
+    ax.text(0.55, 9.62, view["title"], ha="left", va="top", fontsize=13.2, weight="bold", color=c["ink"])
+    ax.text(0.55, 9.26, view["subtitle"], ha="left", va="top", fontsize=8.6, color=c["muted"])
+    _apparatus_legend(ax, 10.05, 8.54, w=3.35, h=1.14)
+    return fig
+
+
+def _loading_dose_apparatus_lines(item: dict) -> list[str]:
+    lines = [f"loading dose {item['loading_dose_mg']:.3f} mg"]
+    volume = item.get("loading_volume_ml")
+    concentration = item.get("loading_concentration_mg_ml")
+    if volume and concentration is not None:
+        lines.append(f"in {volume:g} mL = {_fmt_ug_per_ml(concentration)}")
+    rate = item.get("loading_infusion_rate_ml_h")
+    if rate:
+        lines.append(f"at {rate:.2f} mL/h over {item.get('loading_duration_h', 0):g} h")
+    return lines
+
+
+def _central_drug_apparatus_groups(drug_inputs: dict, summary: dict, skip: str | None = None) -> list[tuple[str, list[str]]]:
+    """Per-drug dosing instructions for every drug dosed straight into the central compartment."""
+    groups = []
+    for name, values in drug_inputs.items():
+        if name == skip:
             continue
-        values = drug_inputs.get(name)
         item = summary.get(name)
-        if not values or not item:
+        if not isinstance(item, dict):
             continue
-        if values["loading_dose"]:
-            loading_volume_ml = item.get("loading_volume_ml", values.get("loading_volume_ml", 0.0))
-            loading_concentration = item.get(
-                "loading_concentration_mg_ml",
-                item["loading_dose_mg"] / loading_volume_ml if loading_volume_ml else 0.0,
-            )
-            loading_rate_ml_h = item.get(
-                "loading_infusion_rate_ml_h",
-                loading_volume_ml / item["loading_duration_h"] if item["loading_duration_h"] else 0.0,
-            )
-            central_other_lines.append(
-                f"{name} LD direct: target {values['loading_target_concentration_mg_l']:.1f} mg/L"
-            )
-            central_other_lines.append(
-                f"weigh {item['loading_dose_mg']:.3f} mg in {loading_volume_ml:g} mL"
-            )
-            central_other_lines.append(
-                f"stock {loading_concentration:.4f} mg/mL; {loading_rate_ml_h:.2f} mL/h"
-            )
-        if values["maintenance"] == "continuous infusion":
+        lines: list[str] = []
+        if values.get("loading_dose"):
+            lines.extend(_loading_dose_apparatus_lines(item))
+        maintenance = values.get("maintenance")
+        if maintenance == "continuous infusion":
             concentration = item.get("central_diluent_concentration_mg_ml")
             if concentration is not None:
-                weigh_mg = item["central_diluent_drug_per_24h_mg"] * 1.10
-                central_diluent_lines.append(f"{name}: {concentration * 1000:.2f} ug/mL; weigh {weigh_mg:.2f} mg")
+                lines.append(f"then CI at {_fmt_ug_per_ml(concentration)}")
+                lines.append("mixed in diluent central")
+                lines.append(f"weigh {item['central_diluent_drug_per_24h_mg'] * 1.10:.2f} mg/q24h")
             else:
-                central_other_lines.append(f"{name} CI in Diluent Central")
-                central_diluent_lines.append(f"{name} needs separate CI")
-        if values["maintenance"] == "intermittent infusion":
-            central_other_lines.append(
-                f"{name} q{item['intermittent_interval_h']:.1f}h {item['intermittent_dose_mg']:.3f} mg/{item['intermittent_duration_h']:.2f}h"
-            )
-    if not setup_central_lines:
-        setup_central_lines = [f"No {setup_drug_name} central dosing"]
-    if not central_other_lines:
-        central_other_lines = ["No other central dosing"]
-    if not extra_lines:
-        extra_lines = ["No extra drug dosing selected"]
+                lines.append("then CI in diluent central")
+        elif maintenance == "intermittent infusion":
+            interval = item.get("intermittent_interval_h", 0)
+            dose_mg = item.get("intermittent_dose_mg", 0.0)
+            lines.append(f"then every {interval:g} h: {dose_mg:.3f} mg")
+            dose_volume = values.get("dose_volume_ml")
+            if dose_volume:
+                lines.append(f"in {dose_volume:g} mL = {_fmt_ug_per_ml(dose_mg / dose_volume)}")
+                duration_h = item.get("intermittent_duration_h") or 0
+                if duration_h:
+                    lines.append(f"at {dose_volume / (duration_h * 60):.3f} mL/min over {duration_h:g} h")
+            if interval:
+                lines.append(f"{dose_mg * 24 / interval:.2f} mg/day")
+        if lines:
+            groups.append((name, lines))
+    return groups
+
+
+def _two_half_life_apparatus_view(
+    system: SystemConfig,
+    fos: FosfomycinConfig,
+    drug_inputs: dict,
+    summary: dict,
+    scenario: str,
+    duration_h: float,
+    recirculation_ml_min: float,
+    shared_half_life_h: float,
+) -> dict:
+    interval_h = fos.dosing_interval_min / 60
+    dose_volume_ml = fos.central_infusion_ml_min * fos.infusion_duration_min
+    setup_lines = [
+        f"{fos.central_dose_mg:.3f} mg in {dose_volume_ml:g} mL",
+        _fmt_ug_per_ml(fos.central_stock_mg_ml),
+        f"at {fos.central_infusion_ml_min:.3f} mL/min over {fos.infusion_duration_min / 60:g} h",
+        f"{fos.central_dose_mg * 24 / interval_h:.2f} mg/day",
+    ]
+    central_groups = [(f"{fos.drug_name} q{interval_h:g}h", setup_lines)]
+    central_groups.extend(_central_drug_apparatus_groups(drug_inputs, summary, skip=fos.drug_name))
+
+    if scenario == "q24_replacement":
+        fill_mg = fos.extra_stock_mg_ml * system.extra_volume_ml
+        extra_groups = [(
+            f"{fos.drug_name} extra q{fos.reservoir_replacement_interval_h:g}h",
+            [
+                "full compartment replacement",
+                f"{system.extra_volume_ml:g} mL fill",
+                _fmt_ug_per_ml(fos.extra_stock_mg_ml),
+                f"{fill_mg:.3f} mg per replacement",
+                f"+10%: {system.extra_volume_ml * 1.10:.1f} mL / {fill_mg * 1.10:.1f} mg",
+            ],
+        )]
+    else:
+        extra_dose_volume_ml = fos.extra_infusion_ml_min * fos.infusion_duration_min
+        extra_groups = [(
+            f"{fos.drug_name} extra q{interval_h:g}h",
+            [
+                f"{fos.extra_dose_mg:.3f} mg in {extra_dose_volume_ml:g} mL",
+                _fmt_ug_per_ml(fos.extra_stock_mg_ml),
+                f"at {fos.extra_infusion_ml_min:.3f} mL/min over {fos.infusion_duration_min / 60:g} h",
+                "extra volume held by overflow line",
+            ],
+        )]
+
     return {
-        "setup_central": setup_central_lines,
-        "central_other": central_other_lines,
-        "central_other_drugs": [name for name in drug_inputs if name != setup_drug_name],
-        "central_diluent": central_diluent_lines,
-        "extra": extra_lines,
-        "setup_drug": setup_drug_name,
+        "title": "HFIM apparatus - 2 half life (central + extra)",
+        "subtitle": (
+            f"{fos.drug_name} shaped by central + extra   |   shared central half-life "
+            f"{shared_half_life_h:g} h   |   {duration_h:g} h run"
+        ),
+        "cartridge_volume": f"{system.cartridge_ml:g} mL",
+        "central_volume": f"{system.central_bottle_ml:g} mL",
+        "extra_volume": f"{system.extra_volume_ml:g} mL",
+        "waste_total": f"{system.q_waste_ml_min * duration_h * 60:,.0f} mL",
+        "central_diluent_total": f"{system.q_central_diluent_ml_min * duration_h * 60:,.0f} mL",
+        "extra_diluent_total": f"{system.q_extra_diluent_ml_min * duration_h * 60:,.0f} mL",
+        "recirculation": f"{recirculation_ml_min:g} mL/min",
+        "waste_flow": f"{system.q_waste_ml_min:.3f} mL/min",
+        "extra_to_central_flow": f"{system.q_extra_to_central_ml_min:.3f} mL/min",
+        "central_diluent_flow": f"{system.q_central_diluent_ml_min:.3f} mL/min",
+        "extra_diluent_flow": f"{system.q_extra_diluent_ml_min:.3f} mL/min",
+        "show_extra_diluent": scenario != "q24_replacement" and system.q_extra_diluent_ml_min > 0,
+        "central_injection_groups": central_groups,
+        "extra_injection_groups": extra_groups,
     }
 
 
-def _plot_setup_schematic(system_values: dict[str, str], injection_values: dict[str, list[str]], scenario: str):
+def _one_half_life_apparatus_view(
+    system: SystemConfig,
+    drug_inputs: dict,
+    summary: dict,
+    duration_h: float,
+    recirculation_ml_min: float,
+    shared_half_life_h: float,
+) -> dict:
+    return {
+        "title": "HFIM apparatus - 1 half life (central only)",
+        "subtitle": (
+            f"Shared half-life {shared_half_life_h:g} h   |   Q = ln(2) x {system.central_volume_ml:g} mL / "
+            f"({shared_half_life_h:g} h x 60) = {system.q_central_diluent_ml_min:.3f} mL/min   |   {duration_h:g} h run"
+        ),
+        "cartridge_volume": f"{system.cartridge_ml:g} mL",
+        "central_volume": f"{system.central_bottle_ml:g} mL",
+        "waste_total": f"{system.q_central_diluent_ml_min * duration_h * 60:,.0f} mL",
+        "central_diluent_total": f"{system.q_central_diluent_ml_min * duration_h * 60:,.0f} mL",
+        "recirculation": f"{recirculation_ml_min:g} mL/min",
+        "waste_flow": f"{system.q_central_diluent_ml_min:.3f} mL/min",
+        "central_diluent_flow": f"{system.q_central_diluent_ml_min:.3f} mL/min",
+        "injection_groups": _central_drug_apparatus_groups(drug_inputs, summary),
+    }
+
+
+def _configure_schematic_fonts() -> None:
     import matplotlib as mpl
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Circle, FancyArrowPatch, FancyBboxPatch, Rectangle
 
     mpl.rcParams["svg.fonttype"] = "none"
     mpl.rcParams["pdf.fonttype"] = 42
     mpl.rcParams["ps.fonttype"] = 42
     mpl.rcParams["font.family"] = "DejaVu Sans"
 
-    fig, ax = plt.subplots(figsize=(12.8, 7.2), dpi=180)
-    ax.set_xlim(0, 16)
-    ax.set_ylim(0, 9)
-    ax.axis("off")
-    fig.patch.set_facecolor("white")
-    ax.set_facecolor("white")
 
-    colors = {
-        "ink": "#172033",
-        "muted": "#5a6678",
-        "line": "#40516a",
-        "blue": "#315fbd",
-        "teal": "#117c73",
-        "amber": "#b8650b",
-        "green": "#087a5b",
-        "panel": "#f7f9fc",
-        "panel_edge": "#d7dee8",
-        "blue_fill": "#f3f7ff",
-        "teal_fill": "#f1fbf9",
-        "amber_fill": "#fff9ed",
-        "vessel_fill": "#eaf7fb",
-        "vessel_edge": "#8db5c4",
-    }
-
-    def rounded_panel(x, y, w, h, facecolor="#f8fafc", edgecolor="#cbd5e1", linewidth=1.0, linestyle="solid"):
-        patch = FancyBboxPatch(
-            (x, y),
-            w,
-            h,
-            boxstyle="round,pad=0.05,rounding_size=0.05",
-            linewidth=linewidth,
-            edgecolor=edgecolor,
-            facecolor=facecolor,
-            linestyle=linestyle,
-        )
-        ax.add_patch(patch)
-        return patch
-
-    def wrapped_lines(lines, width=34, max_lines=6):
-        wrapped: list[str] = []
-        for line in lines:
-            line = str(line)
-            chunks = textwrap.wrap(line, width=width, break_long_words=False, break_on_hyphens=False) or [""]
-            wrapped.extend(chunks)
-        if len(wrapped) > max_lines:
-            omitted = len(wrapped) - (max_lines - 1)
-            # Name what was cut instead of a bare "...", since Section 7 has the full, correct numbers
-            # this diagram cannot fit - a silent "..." would hide a real dose/concentration line.
-            wrapped = wrapped[: max_lines - 1] + [f"+{omitted} more (see Section 7)"]
-        return wrapped
-
-    def semantic_text_color(line: str) -> str:
-        text = line.lower()
-        if "mg/dose" in text or "mg/q24h" in text or "weigh" in text or "ld " in text or "ci " in text or "replacement" in text:
-            return colors["amber"]
-        if "ug/ml" in text or "mg/ml" in text or "stock" in text or "concentration" in text:
-            return colors["blue"]
-        if "ml/min" in text or "ml/h" in text or " mg" in text:
-            return colors["amber"]
-        if "ml" in text or "prepare" in text or "+10%" in text or "volume" in text:
-            return colors["green"]
-        return colors["muted"]
-
-    def protocol_row(
-        x,
-        y,
-        w,
-        h,
-        title,
-        lines,
-        accent="#315fbd",
-        facecolor="#f3f7ff",
-        max_lines=5,
-        wrap_width=48,
-        title_fontsize=9.0,
-        body_fontsize=7.0,
-        line_step=0.19,
-    ):
-        ax.add_patch(Rectangle((x, y), w, h, facecolor=facecolor, edgecolor="#dbe4ef", linewidth=0.45))
-        ax.add_patch(Rectangle((x, y), 0.060, h, facecolor=accent, edgecolor=accent, linewidth=0))
-        ax.text(x + 0.20, y + h - 0.18, title, ha="left", va="top", fontsize=title_fontsize, weight="bold", color=colors["ink"])
-        body_lines = wrapped_lines(lines, width=wrap_width, max_lines=max_lines)
-        line_y = y + h - 0.48
-        for i, line in enumerate(body_lines):
-            ax.text(
-                x + 0.20,
-                line_y - i * line_step,
-                line,
-                ha="left",
-                va="top",
-                fontsize=body_fontsize,
-                color=semantic_text_color(line),
-                linespacing=1.0,
-            )
-
-    def color_key(x, y, w, h):
-        ax.add_patch(Rectangle((x, y), w, h, facecolor="#ffffff", edgecolor="#dbe4ef", linewidth=0.45))
-        ax.text(x + 0.20, y + h - 0.18, "Color key", ha="left", va="top", fontsize=8.6, weight="bold", color=colors["ink"])
-        items = [
-            ("Volume", colors["green"]),
-            ("Concentration", colors["blue"]),
-            ("Dose / rate", colors["amber"]),
-            ("Route / note", colors["muted"]),
-        ]
-        x_positions = [x + 0.22, x + 1.92]
-        y_positions = [y + 0.40, y + 0.18]
-        for index, (label, color) in enumerate(items):
-            item_x = x_positions[index % 2]
-            item_y = y_positions[index // 2]
-            ax.add_patch(Rectangle((item_x, item_y), 0.15, 0.15, facecolor=color, edgecolor=color, linewidth=0))
-            ax.text(item_x + 0.23, item_y + 0.075, label, ha="left", va="center", fontsize=6.8, color=colors["muted"])
-
-    def arrow(start, end, label, color="#334155", label_offset=0.18, rad=0.0, label_color=None):
-        ax.add_patch(FancyArrowPatch(
-            start,
-            end,
-            arrowstyle="->",
-            mutation_scale=10,
-            linewidth=1.05,
-            color=color,
-            connectionstyle=f"arc3,rad={rad}",
-        ))
-        if label:
-            ax.text(
-                (start[0] + end[0]) / 2,
-                (start[1] + end[1]) / 2 + label_offset,
-                label,
-                ha="center",
-                va="center",
-                fontsize=7.6,
-                color=label_color or color,
-                bbox={"facecolor": "white", "edgecolor": "none", "pad": 1.2, "alpha": 0.9},
-            )
-
-    def vessel(x, y, w=0.46, h=0.92, fill_level=0.58):
-        body = FancyBboxPatch(
-            (x - w / 2, y - h / 2),
-            w,
-            h,
-            boxstyle="round,pad=0.0,rounding_size=0.11",
-            linewidth=0.8,
-            edgecolor=colors["vessel_edge"],
-            facecolor="#ffffff",
-            zorder=3,
-        )
-        ax.add_patch(body)
-        liquid_h = h * fill_level
-        ax.add_patch(Rectangle(
-            (x - w / 2 + 0.04, y - h / 2 + 0.04),
-            w - 0.08,
-            liquid_h,
-            facecolor=colors["vessel_fill"],
-            edgecolor="none",
-            alpha=0.9,
-            zorder=3.1,
-        ))
-        ax.add_patch(Rectangle((x - w * 0.23, y + h / 2 - 0.02), w * 0.46, 0.11, facecolor="#eef2f6", edgecolor=colors["vessel_edge"], linewidth=0.7, zorder=3.2))
-        ax.add_patch(Rectangle((x - w * 0.18, y + h / 2 + 0.09), w * 0.36, 0.10, facecolor="#f8fafc", edgecolor=colors["vessel_edge"], linewidth=0.7, zorder=3.2))
-        ax.plot([x - w * 0.15, x + w * 0.15], [y - h * 0.10, y - h * 0.13], color="#7fb6c8", linewidth=0.55, zorder=3.3)
-
-    def cartridge(x, y, w=2.10, h=0.34):
-        rounded_panel(x - w / 2, y - h / 2, w, h, facecolor="#f7fafc", edgecolor="#94a3b8", linewidth=0.75)
-        for side in (-1, 1):
-            ax.add_patch(Rectangle((x + side * w / 2 - side * 0.09 - (0.08 if side > 0 else 0), y - h * 0.62), 0.16, h * 1.24, facecolor="#eef2f6", edgecolor="#94a3b8", linewidth=0.65))
-            ax.add_patch(Circle((x + side * (w / 2 + 0.13), y), radius=0.13, facecolor="#eef2f6", edgecolor="#94a3b8", linewidth=0.65))
-        for i in range(8):
-            xi = x - w * 0.34 + i * w * 0.095
-            ax.plot([xi, xi + 0.16], [y - h * 0.22, y + h * 0.22], color="#c6d3df", linewidth=0.45, zorder=3.5)
-
-    def component_label(x, y, title, value, align="center", value_color=None):
-        ax.text(x, y, title, ha=align, va="top", fontsize=8.8, weight="bold", color=colors["ink"], zorder=6)
-        if value:
-            ax.text(x, y - 0.27, value, ha=align, va="top", fontsize=8.0, color=value_color or colors["green"], zorder=6)
-
-    setup_drug = injection_values["setup_drug"]
-
-    rounded_panel(0.45, 0.55, 7.35, 7.95, facecolor="#ffffff", edgecolor="#d4dde9", linewidth=0.75, linestyle=(0, (4, 4)))
-    rounded_panel(8.05, 2.60, 7.50, 5.90, facecolor=colors["panel"], edgecolor=colors["panel_edge"], linewidth=0.75)
-    ax.text(0.70, 8.15, "HFIM system overview", ha="left", va="top", fontsize=13.4, weight="bold", color=colors["ink"])
-    ax.text(8.38, 8.15, "Protocol recipe", ha="left", va="top", fontsize=13.4, weight="bold", color=colors["ink"])
-
-    cartridge(4.05, 6.35)
-    vessel(4.08, 4.08, w=0.50, h=0.98, fill_level=0.62)
-    vessel(1.28, 4.05, w=0.42, h=0.84, fill_level=0.18)
-    vessel(6.65, 4.08, w=0.44, h=0.86, fill_level=0.58)
-    vessel(3.15, 1.78, w=0.42, h=0.84, fill_level=0.45)
-
-    component_label(4.05, 7.05, "Hollow fiber cartridge", system_values["Cartridge"])
-    component_label(4.08, 3.22, "Central compartment", system_values["Central"])
-    component_label(1.28, 2.9, "Waste", system_values["Waste"], value_color=colors["amber"])
-    component_label(6.65, 2.92, "Extra compartment", system_values["Extra"])
-    component_label(3.15, 1.02, "Central diluent q24h", "")
-
-    if scenario == "overflow":
-        vessel(7.42, 2.7, w=0.38, h=0.76, fill_level=0.12)
-        component_label(7.42, 1.82, "Extra overflow", system_values["Extra overflow"], value_color=colors["amber"])
-    if scenario != "q24_replacement":
-        vessel(6.65, 1.6, w=0.42, h=0.84, fill_level=0.45)
-        component_label(6.65, 0.72, "Diluent Extra", system_values["Extra diluent"], value_color=colors["amber"])
-
-    arrow((6.08, 4.08), (4.72, 4.08), system_values["Extra to central"], color=colors["line"], label_color=colors["amber"])
-    arrow((3.48, 4.05), (1.92, 4.05), system_values["Waste"], color=colors["line"], label_color=colors["amber"])
-    central_diluent_drugs = [
-        line.split(":", 1)[0]
-        for line in injection_values.get("central_diluent", [])
-        if ":" in line and not line.startswith("+")
-    ]
-    if central_diluent_drugs:
-        ax.text(3.15, 0.76, " / ".join(central_diluent_drugs) + " CI", ha="center", va="top", fontsize=8.2, weight="bold", color=colors["teal"])
-    arrow((3.44, 2.22), (3.78, 3.46), "", color=colors["teal"], label_offset=0.02, rad=-0.08)
-    ax.text(
-        3.78,
-        2.42,
-        system_values["Central diluent"],
-        ha="left",
-        va="center",
-        fontsize=7.6,
-        color=colors["amber"],
-        bbox={"facecolor": "white", "edgecolor": "none", "pad": 1.0, "alpha": 0.92},
+def _render_schematic_export_buttons(st, fig, key_prefix: str, file_prefix: str) -> None:
+    export_cols = st.columns(3)
+    export_cols[0].download_button(
+        "SVG",
+        data=_figure_export_bytes(fig, "svg"),
+        file_name=f"{file_prefix}.svg",
+        mime="image/svg+xml",
+        key=f"{key_prefix}_svg",
     )
-    arrow((4.08, 4.7), (4.08, 5.78), system_values["Recirculation"], color=colors["line"], label_color=colors["amber"])
-    arrow((4.48, 5.78), (4.48, 4.82), "", color=colors["line"])
-    ax.text(1.10, 7.42, f"{setup_drug} to central", ha="left", va="bottom", fontsize=8.8, weight="bold", color=colors["blue"])
-    ax.text(3.28, 7.42, " / ".join(injection_values.get("central_other_drugs", [])) or "Other central dosing", ha="left", va="bottom", fontsize=8.8, weight="bold", color=colors["blue"])
-    ax.text(5.95, 7.42, _extra_schematic_title(setup_drug, scenario), ha="left", va="bottom", fontsize=8.8, weight="bold", color=colors["amber"])
-    arrow((1.12, 7.22), (3.38, 4.78), "direct dose", color=colors["blue"], label_offset=0.0)
-    arrow((3.26, 7.22), (4.0, 4.86), "LD direct", color=colors["blue"], label_offset=0.0)
-    if scenario != "q24_replacement":
-        arrow((6.65, 2.08), (6.65, 3.34), "extra diluent", color=colors["teal"], label_offset=0.0)
-        if scenario == "overflow":
-            arrow((6.90, 4.08), (7.35, 3.05), "overflow", color=colors["amber"], label_offset=0.04)
-    else:
-        arrow((6.65, 7.18), (6.65, 4.82), "q24h replacement", color=colors["amber"], label_offset=0.0)
-
-    row_x = 8.32
-    col_gap = 0.22
-    col_w = 3.36
-    right_x = row_x + col_w + col_gap
-    row_w = col_w * 2 + col_gap
-    protocol_row(
-        row_x,
-        6.25,
-        col_w,
-        1.62,
-        f"{setup_drug}: central q6h",
-        injection_values["setup_central"],
-        accent=colors["blue"],
-        facecolor=colors["blue_fill"],
-        wrap_width=34,
-        max_lines=7,
-        body_fontsize=6.0,
-        line_step=0.13,
+    export_cols[1].download_button(
+        "PDF",
+        data=_figure_export_bytes(fig, "pdf"),
+        file_name=f"{file_prefix}.pdf",
+        mime="application/pdf",
+        key=f"{key_prefix}_pdf",
     )
-    other_title = " / ".join(injection_values.get("central_other_drugs", [])) or "Other central dosing"
-    protocol_row(
-        right_x,
-        6.12,
-        col_w,
-        1.75,
-        other_title,
-        injection_values["central_other"],
-        accent=colors["blue"],
-        facecolor="#eef2ff",
-        wrap_width=62,
-        max_lines=9,
-        body_fontsize=5.45,
-        line_step=0.12,
+    export_cols[2].download_button(
+        "PNG",
+        data=_figure_export_bytes(fig, "png"),
+        file_name=f"{file_prefix}.png",
+        mime="image/png",
+        key=f"{key_prefix}_png",
     )
-    central_diluent_lines = injection_values.get("central_diluent", []) or ["No continuous-infusion drugs mixed"]
-    protocol_row(
-        row_x,
-        4.38,
-        col_w,
-        1.62,
-        "Central diluent q24h",
-        central_diluent_lines,
-        accent=colors["teal"],
-        facecolor=colors["teal_fill"],
-        wrap_width=48,
-        max_lines=7,
-        body_fontsize=5.75,
-        line_step=0.13,
-    )
-    extra_title = _extra_schematic_title(setup_drug, scenario)
-    protocol_row(
-        right_x,
-        4.38,
-        col_w,
-        1.62,
-        extra_title,
-        injection_values["extra"],
-        accent=colors["amber"],
-        facecolor=colors["amber_fill"],
-        wrap_width=36,
-        max_lines=7,
-        body_fontsize=5.9,
-        line_step=0.13,
-    )
-    flow_lines = [
-        f"Central outflow: {system_values['Waste']}",
-        f"Qextra to central: {system_values['Extra to central']}",
-        f"Central diluent: {system_values['Central diluent']}",
-    ]
-    protocol_row(row_x, 2.92, col_w, 1.18, "System flow rates", flow_lines, accent=colors["line"], facecolor="#ffffff", max_lines=5, wrap_width=34, body_fontsize=5.9, line_step=0.13)
-    color_key(right_x, 2.92, col_w, 1.18)
-
-    fig.tight_layout()
-    return fig
 
 
 def _figure_export_bytes(fig, file_format: str, dpi: int = 300) -> bytes:
@@ -1424,18 +1796,6 @@ def _figure_export_bytes(fig, file_format: str, dpi: int = 300) -> bytes:
         save_kwargs["dpi"] = dpi
     fig.savefig(buffer, **save_kwargs)
     return buffer.getvalue()
-
-
-def _extra_schematic_title(setup_drug: str, scenario: str) -> str:
-    if scenario == "overflow":
-        return f"{setup_drug} to extra"
-    return f"{setup_drug} extra q24h"
-
-
-def _extra_schematic_arrow_label(scenario: str) -> str:
-    if scenario == "overflow":
-        return "dose to extra"
-    return "extra"
 
 
 def _plot_static(rows: list[dict], drugs: list[str], title: str, include_extra: bool):
@@ -1546,13 +1906,15 @@ def _preparation_review_rows(
     prep_rows: list[dict],
     summary: dict,
     system: SystemConfig,
-    fos: FosfomycinConfig,
+    fos: FosfomycinConfig | None,
     duration_h: float,
 ) -> list[dict]:
     rows = []
     central_recipe = _central_diluent_reservoir_summary(summary, duration_h)
-    extra_summary = _replacement_solution_summary(system, fos, duration_h)
-    interval_h = fos.reservoir_replacement_interval_h
+    # With no setup drug (central_only) there is no extra fill to describe, and no prep row can
+    # carry the "Extra q24h replacement" destination, so the extra summary is simply not needed.
+    extra_summary = _replacement_solution_summary(system, fos, duration_h) if fos is not None else None
+    interval_h = fos.reservoir_replacement_interval_h if fos is not None else 0.0
 
     for row in prep_rows:
         destination = _preparation_destination(row, summary)
@@ -1673,42 +2035,46 @@ def _render_preparation_styles(st) -> None:
     st.markdown(
         """
         <style>
+        /* Light cards matching the app's white page background and the Section 4 schematic's
+        blue/teal/amber color key, instead of the dark glass-panel palette these were originally
+        written for (which rendered as low-contrast gray-on-gray on this light-themed page). */
         .prep-card {
-            border: 1px solid rgba(148, 163, 184, 0.28);
+            border: 1px solid rgba(15, 23, 42, 0.10);
             border-radius: 8px;
             padding: 16px 16px 14px 16px;
             min-height: 238px;
-            background: rgba(15, 23, 42, 0.32);
+            background: #f8fafc;
         }
-        .prep-card-blue { border-top: 4px solid #60a5fa; }
-        .prep-card-teal { border-top: 4px solid #2dd4bf; }
-        .prep-card-amber { border-top: 4px solid #f59e0b; }
+        .prep-card-blue { border-top: 4px solid #315fbd; background: #f3f7ff; }
+        .prep-card-teal { border-top: 4px solid #117c73; background: #f1fbf9; }
+        .prep-card-amber { border-top: 4px solid #b8650b; background: #fff9ed; }
         .prep-card-title {
+            color: #172033;
             font-size: 1.03rem;
             font-weight: 700;
             margin-bottom: 8px;
         }
         .prep-card-drugs {
-            color: #cbd5e1;
+            color: #475569;
             font-size: 0.9rem;
             min-height: 42px;
             margin-bottom: 12px;
         }
         .prep-card-label {
-            color: #94a3b8;
+            color: #5a6678;
             font-size: 0.78rem;
             text-transform: uppercase;
             letter-spacing: 0.02em;
         }
         .prep-card-value {
-            color: #f8fafc;
+            color: #172033;
             font-size: 1.75rem;
             line-height: 1.15;
             font-weight: 700;
             margin-bottom: 10px;
         }
         .prep-card-caption {
-            color: #cbd5e1;
+            color: #475569;
             font-size: 0.86rem;
             line-height: 1.35;
             margin-top: 8px;
@@ -1738,7 +2104,9 @@ def _render_preparation_card(container, card: dict) -> None:
 
 def _solution_volume_rows(q_central_diluent: float, q_extra_diluent: float, scenario: str, duration_h: float) -> list[dict]:
     rows = [_solution_volume_row("Central diluent", q_central_diluent, duration_h)]
-    if scenario not in {"q24_replacement"}:
+    # Only overflow runs a continuous extra feed. q24 replacement prepares a fill instead, and
+    # central_only has no extra compartment at all, so neither should list an extra diluent volume.
+    if scenario == "overflow":
         rows.append(_solution_volume_row("Extra diluent / feed volume", q_extra_diluent, duration_h))
     return rows
 
@@ -2031,6 +2399,412 @@ def _equation_text(
             f"   Extra volume per 24 h with 10% extra = {extra_daily_volume:.1f} x 1.10 = {extra_daily_volume * 1.10:.1f} mL",
         ])
     return "```text\n" + "\n".join(lines) + "\n```"
+
+
+# ---------------------------------------------------------------------------
+# "1 half life" page: single drug, or a combination where every drug shares one
+# half-life. Central compartment only - no extra compartment exists, so central
+# washout comes straight from that one half-life with no shortest-half-life
+# compromise, and Cmax is a reported outcome rather than a solvable target.
+# ---------------------------------------------------------------------------
+
+_ONE_TARGET_TYPES = ["Maintain concentration", "AUC0-24 exposure"]
+_ONE_MAINTENANCE = ["continuous infusion", "intermittent infusion", "no maintenance"]
+_PEAK_SHAPING_INTERVALS_H = (2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0)
+
+
+def _one_half_life_drug_defaults(index: int) -> dict:
+    presets = [
+        {"name": "imipenem", "target_type": "Maintain concentration", "target_value": 9.0, "loading_dose": True, "maintenance": "continuous infusion"},
+        {"name": "relebactam", "target_type": "Maintain concentration", "target_value": 6.0, "loading_dose": True, "maintenance": "continuous infusion"},
+        {"name": "meropenem", "target_type": "Maintain concentration", "target_value": 16.0, "loading_dose": False, "maintenance": "intermittent infusion"},
+    ]
+    if index < len(presets):
+        return presets[index]
+    return {"name": f"drug{index + 1}", "target_type": "Maintain concentration", "target_value": 10.0, "loading_dose": False, "maintenance": "continuous infusion"}
+
+
+def _one_half_life_drug_panel(st, active_drug_count: int, shared_half_life_h: float) -> dict[str, dict]:
+    """Drug cards for the shared-half-life page: no per-drug half-life, plus a dose volume for
+    intermittent drugs so the bench gets a stock concentration rather than only mg per dose."""
+    selected: dict[str, dict] = {}
+    for index in range(active_drug_count):
+        default = _one_half_life_drug_defaults(index)
+        with st.container(border=True):
+            st.markdown(f"**Drug {index + 1}**")
+            cols = st.columns(4)
+            raw_name = cols[0].text_input("Drug name", value=default["name"], key=f"one_name_{index}")
+            name = _normalized_unique_drug_name(raw_name, index, set(selected))
+            if raw_name.strip().lower() != name:
+                st.caption(f"Internal simulation name: {name}")
+            target_type = cols[1].selectbox(
+                "Simulation target",
+                _ONE_TARGET_TYPES,
+                index=_ONE_TARGET_TYPES.index(default["target_type"]),
+                key=f"one_target_type_{index}",
+                help="Cmax is not a target on this page - it follows from the interval and the shared half-life.",
+            )
+            target_label = "Target Css (mg/L)" if target_type == "Maintain concentration" else "Target AUC0-24 (mg*h/L)"
+            target_value = cols[2].number_input(target_label, min_value=0.0, value=float(default["target_value"]), step=1.0, key=f"one_target_value_{index}")
+            cols[3].metric("Half-life", f"{shared_half_life_h:g} h")
+
+            dosing_cols = st.columns(3)
+            loading_dose = dosing_cols[0].checkbox("Loading dose", value=default["loading_dose"], key=f"one_loading_{index}")
+            maintenance = dosing_cols[1].selectbox(
+                "Maintenance dosing",
+                _ONE_MAINTENANCE,
+                index=_ONE_MAINTENANCE.index(default["maintenance"]),
+                key=f"one_maintenance_{index}",
+            )
+            dosing_frequency_h = dosing_cols[2].number_input(
+                "Dosing frequency (h)",
+                min_value=0.0,
+                value=8.0 if maintenance == "intermittent infusion" else 0.0,
+                step=1.0,
+                disabled=maintenance != "intermittent infusion",
+                help="Only intermittent infusion uses a q-hour dosing interval.",
+                key=f"one_frequency_{index}",
+            )
+
+            loading_target = 0.0
+            loading_duration_h = 0.0
+            loading_volume_ml = 5.0
+            maintenance_duration_h = 0.5
+            dose_volume_ml = 8.0
+            detail_cols = st.columns(4)
+            if loading_dose:
+                loading_target = detail_cols[0].number_input(
+                    "Loading target (mg/L)",
+                    min_value=0.0,
+                    value=target_value * (1.0 if target_type == "Maintain concentration" else 1.0 / 24.0) * 2.0,
+                    step=1.0,
+                    key=f"one_loading_target_{index}",
+                )
+                loading_duration_h = detail_cols[1].number_input("Loading infusion duration (h)", min_value=0.0, value=0.5, step=0.25, key=f"one_loading_duration_{index}")
+                loading_volume_ml = detail_cols[2].number_input("Loading dose volume (mL)", min_value=0.01, value=5.0, step=0.5, key=f"one_loading_volume_{index}")
+            if maintenance == "intermittent infusion":
+                maintenance_duration_h = detail_cols[3].number_input("Maintenance infusion duration (h)", min_value=0.01, value=0.5, step=0.25, key=f"one_maintenance_duration_{index}")
+                dose_volume_ml = st.number_input(
+                    "Dose volume per intermittent dose (mL)",
+                    min_value=0.01,
+                    value=8.0,
+                    step=0.5,
+                    help="Volume pumped per dose. Sets the stock concentration you actually prepare, not the mg per dose.",
+                    key=f"one_dose_volume_{index}",
+                )
+
+            selected[name] = {
+                "target_type": target_type,
+                "target_value": target_value,
+                "target_concentration_mg_l": _target_to_concentration(target_type, target_value),
+                "half_life_h": shared_half_life_h,
+                "dosing_mode": _dosing_mode_from_controls(loading_dose, maintenance),
+                "loading_dose": loading_dose,
+                "maintenance": maintenance,
+                "dosing_frequency_h": dosing_frequency_h,
+                "loading_target_concentration_mg_l": loading_target if loading_dose else None,
+                "loading_duration_h": loading_duration_h,
+                "loading_volume_ml": loading_volume_ml,
+                "maintenance_duration_h": maintenance_duration_h,
+                "dose_volume_ml": dose_volume_ml if maintenance == "intermittent infusion" else None,
+            }
+    return selected
+
+
+def _peak_shaping_rows(drug_inputs: dict, summary: dict, shared_half_life_h: float) -> list[dict]:
+    """What Cmax/Cmin each candidate interval would give at the same Cavg.
+
+    Cavg is the only target this page can hit, so the dosing interval is the lever that shapes the
+    peak. Listing the trade-off makes that second knob visible instead of leaving the user to guess
+    why there is no Target Cmax box.
+    """
+    rows = []
+    for name, values in drug_inputs.items():
+        if values.get("maintenance") != "intermittent infusion":
+            continue
+        item = summary.get(name)
+        if not isinstance(item, dict):
+            continue
+        cavg = item.get("target_concentration_mg_l", 0.0)
+        duration_h = item.get("intermittent_duration_h") or 0.5
+        current_interval = item.get("intermittent_interval_h")
+        row: dict[str, str] = {"Drug": name, "Target Cavg": f"{cavg:.1f} mg/L"}
+        for interval_h in _PEAK_SHAPING_INTERVALS_H:
+            cmax, cmin = intermittent_peak_trough(cavg, shared_half_life_h, interval_h, duration_h)
+            marker = " *" if current_interval and abs(interval_h - current_interval) < 1e-9 else ""
+            row[f"q{interval_h:g}h"] = f"{cmax:.1f} / {cmin:.1f}{marker}"
+        rows.append(row)
+    return rows
+
+
+def _one_half_life_equation_text(
+    system: SystemConfig,
+    shared_half_life_h: float,
+    duration_h: float,
+    drug_inputs: dict,
+    summary: dict,
+) -> str:
+    q = system.q_central_diluent_ml_min
+    lines = [
+        "1. Central effective volume",
+        f"   Vc = central bottle + cartridge = {system.central_bottle_ml:g} + {system.cartridge_ml:g} = {system.central_volume_ml:g} mL",
+        "",
+        "2. Central washout from the one shared half-life",
+        "   Q = ln(2) x Vc / (t1/2 x 60)",
+        f"   Q = ln(2) x {system.central_volume_ml:g} / ({shared_half_life_h:g} x 60) = {q:.6g} mL/min",
+        "   Every drug shares this one flow, so there is no shortest-half-life compromise and no",
+        "   extra compartment is needed to reshape any drug's apparent half-life.",
+        "",
+        "3. Maintenance dose from the target concentration",
+        "   Continuous infusion:  rate mg/min = Css x Q / 1000",
+        "   Central diluent reservoir concentration = rate mg/min / Q",
+        "   Intermittent infusion:  dose per interval = Css x Q x interval / 1000",
+        "",
+        "4. Resulting peak and trough (not independent targets)",
+        "   Cmax,ss = Cavg x (interval / infusion duration) x (1 - e^-kT) / (1 - e^-k*tau)",
+        "   Cmin,ss = Cmax,ss x e^-k(tau - T),  where k = ln(2) / t1/2",
+        "",
+        "5. Solution volume to prepare",
+        f"   Central diluent per 24 h = Q x 1440 = {q:.6g} x 1440 = {q * 1440:.1f} mL",
+        f"   Central diluent per 24 h with 10% extra = {q * 1440 * 1.10:.1f} mL",
+        f"   Central diluent for {duration_h:g} h = {q * duration_h * 60:.1f} mL",
+        "",
+        "6. Per-drug numbers",
+    ]
+    for name, values in drug_inputs.items():
+        item = summary.get(name)
+        if not isinstance(item, dict):
+            continue
+        lines.append(f"   {name}: target {item.get('target_concentration_mg_l', 0):g} mg/L, mode = {item.get('dosing_mode')}")
+        if values.get("loading_dose"):
+            lines.append(f"      loading dose = {item.get('loading_dose_mg', 0):.3f} mg in {item.get('loading_volume_ml', 0):g} mL")
+        if values.get("maintenance") == "continuous infusion":
+            lines.append(f"      CI rate = {item.get('infusion_rate_mg_h', 0):.3f} mg/h -> {item.get('daily_amount_mg', 0):.3f} mg/day")
+        if values.get("maintenance") == "intermittent infusion":
+            lines.append(
+                f"      q{item.get('intermittent_interval_h', 0):g}h dose = {item.get('intermittent_dose_mg', 0):.3f} mg"
+                f" over {item.get('intermittent_duration_h', 0):g} h"
+            )
+    lines.extend([
+        "",
+        "7. Differential equation used during each time step",
+        "   Ccentral = Acentral / Vcentral",
+        "   dAcentral/dt = dosing input - Q x Ccentral",
+    ])
+    return "```text\n" + "\n".join(lines) + "\n```"
+
+
+def _page_one_half_life() -> None:
+    import streamlit as st
+
+    st.title("HFIM PK Simulator - 1 half life")
+    st.caption(
+        "Single drug, or a combination where every drug shares one half-life. Central compartment only: "
+        "central washout comes straight from that shared half-life, so no extra compartment is needed."
+    )
+
+    st.subheader("1. Simulation setup")
+    setup_cols = st.columns(3)
+    active_drug_count = int(setup_cols[0].number_input(
+        "Number of drugs", min_value=1, max_value=6, value=1, step=1, key="one_drug_count",
+        help="Works for a single drug as well as a combination, as long as they share one half-life.",
+    ))
+    duration_h = setup_cols[1].number_input("Simulation duration (h)", min_value=24.0, value=168.0, step=24.0, key="one_duration")
+    dt_min = setup_cols[2].number_input("Time step (min)", min_value=0.25, value=1.0, step=0.25, key="one_dt")
+
+    with st.expander("Compartment and flow settings", expanded=True):
+        st.markdown(
+            "Central washout is set directly by the one shared half-life: **Q = ln(2) x Vc / t1/2**. "
+            "There is no extra compartment and no extra-to-central transfer on this page."
+        )
+        cols = st.columns(4)
+        central_bottle_ml = cols[0].number_input("Central bottle (mL)", min_value=1.0, value=100.0, step=5.0, key="one_bottle")
+        cartridge_ml = cols[1].number_input("Cartridge (mL)", min_value=1.0, value=70.0, step=5.0, key="one_cartridge")
+        shared_half_life_h = cols[2].number_input(
+            "Shared half-life (h)", min_value=0.01, value=1.25, step=0.05, key="one_half_life",
+            help="Every drug on this page uses this half-life. Use the 2 half life page when they differ.",
+        )
+        recirculation_ml_min = cols[3].number_input(
+            "Cartridge recirculation (mL/min)", min_value=1.0, value=120.0, step=5.0, key="one_recirc",
+            help="Shown on the diagram only; it does not feed the PK calculation.",
+        )
+        central_volume_ml = central_bottle_ml + cartridge_ml
+        auto_flow = flow_for_half_life(central_volume_ml, shared_half_life_h)
+        flow_cols = st.columns(3)
+        flow_mode = flow_cols[0].selectbox("Flow setup mode", ["Auto flow from shared half-life", "Manual flow entry"], key="one_flow_mode")
+        auto_flow_mode = flow_mode.startswith("Auto")
+        q_central = flow_cols[1].number_input(
+            "Central diluent = central outflow (mL/min)",
+            min_value=0.0,
+            value=auto_flow,
+            step=0.001,
+            format="%.3f",
+            disabled=auto_flow_mode,
+            key=f"one_qcentral_{'auto' if auto_flow_mode else 'manual'}_{central_volume_ml:.1f}_{shared_half_life_h:.3f}",
+        )
+        achieved = half_life_for_flow(central_volume_ml, q_central) if q_central > 0 else None
+        flow_cols[2].metric("Achieved half-life", f"{achieved:.2f} h" if achieved else "not defined")
+        st.info(
+            f"Vc = {central_bottle_ml:g} + {cartridge_ml:g} = {central_volume_ml:g} mL. "
+            f"Q = ln(2) x {central_volume_ml:g} mL / ({shared_half_life_h:g} h x 60) = {auto_flow:.3f} mL/min. "
+            f"Inflow and outflow are matched, so the central volume stays fixed."
+        )
+
+    st.subheader("2. Drug targets and dosing")
+    st.caption(
+        "Set a Css or AUC0-24 target per drug. Cmax is not an input here: with one shared washout it follows "
+        "from the dosing interval and the half-life, and Section 5 shows how to shape it."
+    )
+    drug_inputs = _one_half_life_drug_panel(st, active_drug_count, shared_half_life_h)
+
+    system = SystemConfig(
+        central_bottle_ml=central_bottle_ml,
+        cartridge_ml=cartridge_ml,
+        extra_volume_ml=1.0,
+        q_extra_to_central_ml_min=0.0,
+        q_extra_diluent_ml_min=0.0,
+        q_central_diluent_ml_min=q_central,
+    )
+    drugs = [
+        DrugConfig(
+            name,
+            target_concentration_mg_l=values["target_concentration_mg_l"],
+            half_life_h=values["half_life_h"],
+            dosing_mode=values["dosing_mode"],
+            loading_target_concentration_mg_l=values["loading_target_concentration_mg_l"],
+            loading_duration_h=values["loading_duration_h"],
+            loading_volume_ml=values["loading_volume_ml"],
+            intermittent_interval_h=values["dosing_frequency_h"] or 8.0,
+            intermittent_duration_h=values["maintenance_duration_h"],
+        )
+        for name, values in drug_inputs.items()
+    ]
+    result = simulate_hfim("central_only", system, None, drugs, duration_h=duration_h, dt_min=dt_min)
+
+    st.subheader("3. Setup and injection overview")
+    apparatus_fig = _plot_one_half_life_apparatus(_one_half_life_apparatus_view(
+        system, drug_inputs, result.summary, duration_h, recirculation_ml_min, shared_half_life_h,
+    ))
+    st.image(_figure_export_bytes(apparatus_fig, "png", dpi=300), width="stretch")
+    st.caption(
+        "Volumes on the waste and diluent bottles are totals for the whole run. Concentrations are shown "
+        "in µg/mL. The central compartment is magnetically stirred."
+    )
+    _render_schematic_export_buttons(st, apparatus_fig, "apparatus1", "hfim-apparatus-1-half-life")
+
+    st.markdown("**System solution volumes**")
+    st.dataframe(_solution_volume_rows(q_central, 0.0, "central_only", duration_h), width="stretch", hide_index=True)
+
+    st.subheader("4. Result overview")
+    for name in drug_inputs:
+        item = result.summary.get(name)
+        if not isinstance(item, dict):
+            continue
+        drug_rows = [row for row in result.rows if row["drug"] == name]
+        window = [row for row in drug_rows if row["time_h"] >= max(0.0, duration_h - 24)]
+        cavg = sum(row["central_mg_l"] for row in window) / len(window) if window else 0.0
+        cmax = max((row["central_mg_l"] for row in window), default=0.0)
+        cmin = min((row["central_mg_l"] for row in window), default=0.0)
+        target = item.get("target_concentration_mg_l", 0.0)
+        st.markdown(f"**{name}**")
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Target Css", f"{target:.2f} mg/L")
+        metric_cols[1].metric("Simulated Cavg", f"{cavg:.2f} mg/L", f"{cavg - target:+.2f}")
+        metric_cols[2].metric("Resulting Cmax", f"{cmax:.2f} mg/L")
+        metric_cols[3].metric("Resulting Cmin", f"{cmin:.2f} mg/L")
+
+    peak_rows = _peak_shaping_rows(drug_inputs, result.summary, shared_half_life_h)
+    if peak_rows:
+        with st.expander("How to shape Cmax without changing Cavg", expanded=True):
+            st.caption(
+                "Cmax cannot be entered as a target here - the dosing interval is the lever. Each cell shows "
+                "Cmax / Cmin at that interval while holding the same Cavg. The current setting is marked *."
+            )
+            st.dataframe(peak_rows, width="stretch", hide_index=True)
+
+    st.subheader("5. PK concentration")
+    st.pyplot(_plot_static(result.rows, list(drug_inputs), "Central concentration", include_extra=False))
+
+    st.subheader("6. Preparation and weighing plan")
+    _render_preparation_styles(st)
+    prep_rows = _format_preparation_rows(result.summary["drug_preparation"])
+    review_rows = _preparation_review_rows(prep_rows, result.summary, system, None, duration_h)
+    st.markdown("**Final preparation review**")
+    st.caption("Bench checklist: which drug goes into which dosing part, with the amount to weigh.")
+    st.dataframe(
+        review_rows,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Drug": st.column_config.Column(width="small"),
+            "Add into": st.column_config.Column(width="medium"),
+            "Dosing part": st.column_config.Column(width="medium"),
+            "Note": st.column_config.Column(width="large"),
+        },
+    )
+    central_diluent_ci_rows = _central_diluent_reservoir_rows(result.summary, duration_h)
+    if central_diluent_ci_rows:
+        recipe = _central_diluent_reservoir_summary(result.summary, duration_h)
+        st.markdown("**Central diluent q24h shared reservoir recipe**")
+        st.caption("One shared reservoir every 24 h; continuous-infusion drugs are mixed into this same volume.")
+        recipe_cols = st.columns(4)
+        recipe_cols[0].metric("Required volume q24h", recipe["volume_q24h"])
+        recipe_cols[1].metric("10% extra volume q24h", recipe["extra_volume_q24h_10_percent"])
+        recipe_cols[2].metric("Total to prepare q24h", recipe["prepared_volume_q24h"])
+        recipe_cols[3].metric(f"Total to prepare {duration_h:g} h", recipe["prepared_volume_total"])
+        st.dataframe(
+            central_diluent_ci_rows,
+            width="stretch",
+            hide_index=True,
+            column_config={"Note": st.column_config.Column(width="large")},
+        )
+
+    st.subheader("7. Equations")
+    st.markdown(_one_half_life_equation_text(system, shared_half_life_h, duration_h, drug_inputs, result.summary))
+
+    st.subheader("8. HFIM Setup Assistant")
+    agent_context = build_agent_context(
+        system={
+            "central_volume_ml": system.central_volume_ml,
+            "extra_volume_ml": 0.0,
+            "q_extra_to_central_ml_min": 0.0,
+            "q_extra_diluent_ml_min": 0.0,
+            "q_central_diluent_ml_min": q_central,
+            "scenario": "central_only",
+            "shared_half_life_h": shared_half_life_h,
+        },
+        setup_drug_name=next(iter(drug_inputs), ""),
+        drug_inputs=drug_inputs,
+        summary={name: value for name, value in result.summary.items() if name != "drug_preparation"},
+    )
+    _setup_assistant_panel(st, agent_context)
+
+    if st.button("Run and save to SQLite", key="one_save"):
+        store = SimulationStore(Path("data") / "hfim-simulations.sqlite")
+        started_at = datetime.now(timezone.utc).isoformat()
+        run_id = store.create_run("central_only", started_at, {
+            "scenario": "central_only",
+            "duration_h": duration_h,
+            "dt_min": dt_min,
+            "shared_half_life_h": shared_half_life_h,
+            "central_volume_ml": system.central_volume_ml,
+            "q_central_diluent_ml_min": q_central,
+            "drugs": drug_inputs,
+        })
+        counts = store.upsert_timepoints(run_id, [
+            {
+                "time_min": row["time_min"],
+                "drug": row["drug"],
+                "central": row["central_mg_l"],
+                "extra": row["extra_mg_l"],
+                "central_volume_ml": row["central_volume_ml"],
+                "extra_volume_ml": row["extra_volume_ml"],
+            }
+            for row in result.rows
+        ])
+        prep_counts = store.upsert_preparation_rows(run_id, result.summary["drug_preparation"])
+        store.finish_run(run_id, "success", datetime.now(timezone.utc).isoformat(), f"timepoints={counts}; prep={prep_counts}")
+        st.success(f"Saved run {run_id} to data/hfim-simulations.sqlite")
 
 
 if __name__ == "__main__":
