@@ -12,6 +12,10 @@ class SystemConfig:
     q_extra_to_central_ml_min: float = 0.921
     q_extra_diluent_ml_min: float = 0.921
     q_central_diluent_ml_min: float = 0.65
+    # Waste pump setting when it is a pump of its own rather than "whatever flows in". Only the
+    # Blaser setup uses it: there the waste pump runs slightly faster than the continuous inflow so
+    # it also carries away the dose volumes. None keeps the classic inflow = outflow behaviour.
+    q_waste_set_ml_min: float | None = None
 
     @property
     def central_volume_ml(self) -> float:
@@ -19,6 +23,8 @@ class SystemConfig:
 
     @property
     def q_waste_ml_min(self) -> float:
+        if self.q_waste_set_ml_min is not None:
+            return self.q_waste_set_ml_min
         return self.q_extra_to_central_ml_min + self.q_central_diluent_ml_min
 
 
@@ -150,6 +156,51 @@ class TwoPhaseSolverResult:
     reference_profile_mg_l: tuple
 
 
+@dataclass(frozen=True)
+class BlaserSetup:
+    """Pump settings and doses for a Blaser-type two-half-life setup that needs no adjustment mid-run.
+
+    The two outflow pumps (extra to central, and waste) are set once, slightly above the continuous
+    inflow, so that over each dosing interval they carry away exactly the volume the doses add.
+    Volumes therefore rise during a dose and settle back before the next one instead of building up.
+    predicted_* values describe one dosing interval at steady state.
+    """
+
+    feasible: bool
+    message: str
+    central_volume_ml: float
+    extra_volume_ml: float
+    short_half_life_h: float
+    long_half_life_h: float
+    q_extra_diluent_ml_min: float
+    q_extra_to_central_ml_min: float
+    q_central_diluent_ml_min: float
+    q_waste_ml_min: float
+    uncorrected_q_extra_to_central_ml_min: float
+    uncorrected_q_waste_ml_min: float
+    central_stock_mg_ml: float
+    extra_stock_mg_ml: float
+    central_dose_mg: float
+    extra_dose_mg: float
+    dose_scale: float
+    target_css_mg_l: float
+    predicted_cavg_mg_l: float
+    predicted_cmax_mg_l: float
+    predicted_cmin_mg_l: float
+    reference_cmax_mg_l: float
+    reference_cmin_mg_l: float
+    max_deviation_pct: float
+    apparent_half_life_h: float
+    central_volume_range_ml: tuple
+    extra_volume_range_ml: tuple
+    uncorrected_end_deviation_pct: float
+    uncorrected_end_volumes_ml: tuple
+    deviation_limit_pct: float
+    cycle_time_h: tuple
+    predicted_profile_mg_l: tuple
+    reference_profile_mg_l: tuple
+
+
 def compute_continuous_infusion(
     target_concentration_mg_l: float,
     half_life_h: float,
@@ -244,8 +295,8 @@ def simulate_hfim(
     duration_h: float = 168,
     dt_min: float = 1,
 ) -> SimulationResult:
-    if scenario not in {"q24_replacement", "overflow", "central_only"}:
-        raise ValueError("scenario must be 'q24_replacement', 'overflow', or 'central_only'")
+    if scenario not in {"q24_replacement", "overflow", "central_only", "blaser"}:
+        raise ValueError("scenario must be 'q24_replacement', 'overflow', 'central_only', or 'blaser'")
     if dt_min <= 0:
         raise ValueError("dt_min must be positive")
     if scenario == "central_only":
@@ -278,7 +329,14 @@ def simulate_hfim(
         if fos is not None
         else 0.0
     )
-    shared_continuous_elimination_flow_ml_min = system.q_waste_ml_min + setup_central_average_flow_ml_min
+    # Blaser: the waste pump is a fixed setting that already includes the averaged dose volumes, and
+    # central volume is free to rise and fall, so drug leaves at exactly the waste pump rate.
+    variable_volume = scenario == "blaser"
+    shared_continuous_elimination_flow_ml_min = (
+        system.q_waste_ml_min
+        if variable_volume
+        else system.q_waste_ml_min + setup_central_average_flow_ml_min
+    )
 
     continuous = {
         drug.name: compute_continuous_infusion(
@@ -339,7 +397,7 @@ def simulate_hfim(
         # Second central line (two-phase setup): runs right after the main infusion ends.
         q_fos_slow = _slow_line_rate(time_min, fos) if fos is not None else 0.0
         q_fos_extra = 0.0
-        if fos is not None and scenario == "overflow":
+        if fos is not None and scenario in {"overflow", "blaser"}:
             q_fos_extra = _q6h_rate(time_min, fos.extra_infusion_ml_min, fos.infusion_duration_min, fos.dosing_interval_min)
             if q_fos_extra > 0 and _is_dose_start(time_min, fos.dosing_interval_min):
                 extra_q6h_dose_count += 1
@@ -353,7 +411,14 @@ def simulate_hfim(
             + q_fos_slow * setup_slow_stock_mg_ml
             + system.q_extra_to_central_ml_min * c_extra_mg_ml
         )
-        central_output_mg_min = (system.q_waste_ml_min + q_fos_central + q_fos_slow) * c_central_mg_ml
+        # Fixed-volume setups lose drug at "everything that flows in"; in the Blaser setup the waste
+        # pump rate alone decides it, and the volume absorbs the difference.
+        central_outflow_ml_min = (
+            system.q_waste_ml_min
+            if variable_volume
+            else system.q_waste_ml_min + q_fos_central + q_fos_slow
+        )
+        central_output_mg_min = central_outflow_ml_min * c_central_mg_ml
         extra_input_mg_min = q_fos_extra * setup_extra_stock_mg_ml
         extra_to_central_mg_min = system.q_extra_to_central_ml_min * c_extra_mg_ml
         extra_overflow_mg_min = q_fos_extra * c_extra_mg_ml if scenario == "overflow" else 0.0
@@ -374,8 +439,19 @@ def simulate_hfim(
             # Every drug shares the same fixed central volume, so it washes out against the same total
             # instantaneous outflow, including the setup drug's own central pump flow (q_fos_central),
             # not just the shared diluent/extra-transfer flow.
-            output_mg_min = (system.q_waste_ml_min + q_fos_central + q_fos_slow) * concentration_mg_ml
+            output_mg_min = central_outflow_ml_min * concentration_mg_ml
             drug_amounts[name] = max(0.0, amount + (input_mg_min - output_mg_min) * dt_min)
+
+        if variable_volume:
+            # Volumes move last so the amounts above were all taken at this step's concentrations.
+            ve += (system.q_extra_diluent_ml_min + q_fos_extra - system.q_extra_to_central_ml_min) * dt_min
+            vc += (
+                system.q_extra_to_central_ml_min
+                + system.q_central_diluent_ml_min
+                + q_fos_central
+                + q_fos_slow
+                - system.q_waste_ml_min
+            ) * dt_min
 
     summary = {
         "drug_preparation": _preparation_table(system, fos, continuous, drug_configs, scenario, duration_h),
@@ -862,6 +938,185 @@ def solve_two_phase_replacement(
     )
 
 
+def solve_blaser_setup(
+    central_bottle_ml: float,
+    cartridge_ml: float,
+    short_half_life_h: float,
+    long_half_life_h: float,
+    target_css_mg_l: float,
+    central_dose_volume_ml: float,
+    extra_dose_volume_ml: float,
+    infusion_duration_min: int,
+    dosing_interval_min: int,
+    drug_name: str = "drug",
+    dt_min: float = 1,
+    duration_h: float = 168,
+    deviation_limit_pct: float = 10.0,
+) -> BlaserSetup:
+    """Blaser two-half-life setup with every pump fixed for the whole run.
+
+    Classic Blaser flows give the long-half-life drug its own half-life by diluting an extra
+    compartment in step with central: central washes out at the short half-life, the extra
+    compartment washes out at the long one, and the drug is dosed into both at once.
+
+    Left as published, the doses add volume that the pumps never remove, so both vessels fill up
+    and the half-life drifts longer every day. Here the two outflow pumps are instead set once to
+    the continuous inflow plus the dose volume averaged over the dosing interval, which removes
+    exactly what the doses add. Doses are then scaled so steady-state Cavg matches the target.
+    """
+    central_volume_ml = central_bottle_ml + cartridge_ml
+
+    def infeasible(message: str) -> BlaserSetup:
+        return BlaserSetup(
+            False, message, central_volume_ml, 0.0, short_half_life_h, long_half_life_h,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, target_css_mg_l,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, (0.0, 0.0), (0.0, 0.0), 0.0, (0.0, 0.0),
+            deviation_limit_pct, (), (), (),
+        )
+
+    if (
+        central_volume_ml <= 0
+        or short_half_life_h <= 0
+        or long_half_life_h <= 0
+        or target_css_mg_l <= 0
+        or central_dose_volume_ml <= 0
+        or extra_dose_volume_ml <= 0
+        or infusion_duration_min <= 0
+        or dosing_interval_min <= 0
+        or infusion_duration_min > dosing_interval_min
+        or dt_min <= 0
+    ):
+        return infeasible(
+            "Volumes, half-lives, target, dose volumes, infusion duration and dosing interval must all be "
+            "positive, and the infusion cannot be longer than the dosing interval."
+        )
+    if long_half_life_h <= short_half_life_h * 1.001:
+        return infeasible(
+            f"The selected drug's half-life ({long_half_life_h:g} h) is not longer than the central washout "
+            f"half-life ({short_half_life_h:g} h), so no extra compartment is needed. Use the 1 half life page, "
+            "or select the drug with the longer half-life."
+        )
+
+    q_central_out = flow_for_half_life(central_volume_ml, short_half_life_h)
+    q_central_diluent = flow_for_half_life(central_volume_ml, long_half_life_h)
+    q_extra_diluent = q_central_out - q_central_diluent
+    extra_volume_ml = central_volume_ml * q_extra_diluent / q_central_diluent
+    central_dose_average = central_dose_volume_ml / dosing_interval_min
+    extra_dose_average = extra_dose_volume_ml / dosing_interval_min
+    q_extra_to_central = q_extra_diluent + extra_dose_average
+    q_waste = q_central_out + central_dose_average + extra_dose_average
+
+    k_long_min = math.log(2) / (long_half_life_h * 60)
+    # Classic Blaser doses: the same concentration step in both vessels, sized for the target Cavg.
+    concentration_step_mg_l = target_css_mg_l * k_long_min * dosing_interval_min
+    base_central_dose_mg = concentration_step_mg_l * central_volume_ml / 1000
+    base_extra_dose_mg = concentration_step_mg_l * extra_volume_ml / 1000
+
+    def run(extra_to_central: float, waste: float, scale: float, run_h: float):
+        system = SystemConfig(
+            central_bottle_ml=central_bottle_ml,
+            cartridge_ml=cartridge_ml,
+            extra_volume_ml=extra_volume_ml,
+            q_extra_to_central_ml_min=extra_to_central,
+            q_extra_diluent_ml_min=q_extra_diluent,
+            q_central_diluent_ml_min=q_central_diluent,
+            q_waste_set_ml_min=waste,
+        )
+        fos = FosfomycinConfig(
+            central_stock_mg_ml=base_central_dose_mg * scale / central_dose_volume_ml,
+            extra_stock_mg_ml=base_extra_dose_mg * scale / extra_dose_volume_ml,
+            central_infusion_ml_min=central_dose_volume_ml / infusion_duration_min,
+            extra_infusion_ml_min=extra_dose_volume_ml / infusion_duration_min,
+            infusion_duration_min=infusion_duration_min,
+            dosing_interval_min=dosing_interval_min,
+            preload_extra_mg=0.0,
+            drug_name=drug_name,
+        )
+        rows = simulate_hfim("blaser", system, fos, [], duration_h=run_h, dt_min=dt_min).rows
+        end_min = rows[-1]["time_min"]
+        return [row for row in rows if end_min - dosing_interval_min <= row["time_min"] < end_min - 1e-9]
+
+    interval_h = dosing_interval_min / 60
+    # Long enough for the slow half-life to settle (14 half-lives leaves under 0.01%), in whole intervals.
+    settle_h = max(5, math.ceil(14 * long_half_life_h / interval_h)) * interval_h
+    reference = one_compartment_steady_state_profile(
+        target_css_mg_l, long_half_life_h, dosing_interval_min, infusion_duration_min, dt_min
+    )
+    cycle = run(q_extra_to_central, q_waste, 1.0, settle_h)
+    if len(cycle) != len(reference) or not cycle:
+        return infeasible("The time step must divide the dosing interval evenly.")
+    cavg = sum(row["central_mg_l"] for row in cycle) / len(cycle)
+    if cavg <= 0:
+        return infeasible("The setup delivers no drug to central with these settings.")
+    scale = target_css_mg_l / cavg
+    profile = [row["central_mg_l"] * scale for row in cycle]
+    deviation = max(abs(value / ref - 1) for value, ref in zip(profile, reference)) * 100
+
+    # Apparent half-life over the falling part of the interval (from the end of the infusion on).
+    start_index = min(len(profile) - 2, int(round(infusion_duration_min / dt_min)))
+    end_index = len(profile) - 1
+    if profile[start_index] > profile[end_index] > 0 and end_index > start_index:
+        elapsed_h = (end_index - start_index) * dt_min / 60
+        apparent_half_life_h = math.log(2) * elapsed_h / math.log(profile[start_index] / profile[end_index])
+    else:
+        apparent_half_life_h = long_half_life_h
+
+    # What the published flows would do over the same run length, for comparison on the page.
+    run_h = max(interval_h, math.ceil(duration_h / interval_h) * interval_h)
+    uncorrected_cycle = run(q_extra_diluent, q_central_out, 1.0, run_h)
+    uncorrected_deviation = max(
+        abs(row["central_mg_l"] / ref - 1) for row, ref in zip(uncorrected_cycle, reference)
+    ) * 100
+
+    feasible = deviation <= deviation_limit_pct
+    if feasible:
+        message = (
+            f"Fixed pump settings hold the {long_half_life_h:g} h curve within {deviation:.1f}% at steady state, "
+            "with no drift from one day to the next and no pump changes during the run."
+        )
+    else:
+        message = (
+            f"The setup stays up to {deviation:.1f}% away from the true {long_half_life_h:g} h curve, above the "
+            f"{deviation_limit_pct:g}% limit. The dose volumes are large relative to the vessel volumes; "
+            "use smaller dose volumes or larger vessels."
+        )
+    return BlaserSetup(
+        feasible=feasible,
+        message=message,
+        central_volume_ml=central_volume_ml,
+        extra_volume_ml=extra_volume_ml,
+        short_half_life_h=short_half_life_h,
+        long_half_life_h=long_half_life_h,
+        q_extra_diluent_ml_min=q_extra_diluent,
+        q_extra_to_central_ml_min=q_extra_to_central,
+        q_central_diluent_ml_min=q_central_diluent,
+        q_waste_ml_min=q_waste,
+        uncorrected_q_extra_to_central_ml_min=q_extra_diluent,
+        uncorrected_q_waste_ml_min=q_central_out,
+        central_stock_mg_ml=base_central_dose_mg * scale / central_dose_volume_ml,
+        extra_stock_mg_ml=base_extra_dose_mg * scale / extra_dose_volume_ml,
+        central_dose_mg=base_central_dose_mg * scale,
+        extra_dose_mg=base_extra_dose_mg * scale,
+        dose_scale=scale,
+        target_css_mg_l=target_css_mg_l,
+        predicted_cavg_mg_l=sum(profile) / len(profile),
+        predicted_cmax_mg_l=max(profile),
+        predicted_cmin_mg_l=min(profile),
+        reference_cmax_mg_l=max(reference),
+        reference_cmin_mg_l=min(reference),
+        max_deviation_pct=deviation,
+        apparent_half_life_h=apparent_half_life_h,
+        central_volume_range_ml=(min(row["central_volume_ml"] for row in cycle), max(row["central_volume_ml"] for row in cycle)),
+        extra_volume_range_ml=(min(row["extra_volume_ml"] for row in cycle), max(row["extra_volume_ml"] for row in cycle)),
+        uncorrected_end_deviation_pct=uncorrected_deviation,
+        uncorrected_end_volumes_ml=(uncorrected_cycle[-1]["central_volume_ml"], uncorrected_cycle[-1]["extra_volume_ml"]),
+        deviation_limit_pct=deviation_limit_pct,
+        cycle_time_h=tuple((row["time_min"] - cycle[0]["time_min"]) / 60 for row in cycle),
+        predicted_profile_mg_l=tuple(profile),
+        reference_profile_mg_l=tuple(reference),
+    )
+
+
 def _q6h_rate(time_min: float, rate_ml_min: float, duration_min: int, interval_min: int) -> float:
     return rate_ml_min if time_min % interval_min < duration_min else 0.0
 
@@ -1048,6 +1303,17 @@ def _preparation_table(
                 f"{fos.slow_dose_volume_ml:.3f} mL over {fos.slow_duration_min / 60:g} h "
                 f"at {fos.slow_stock_mg_ml:g} mg/mL and {fos.slow_infusion_ml_min * 60:.3f} mL/h; "
                 f"pump 2 with its own syringe, starts when the main infusion ends"
+            ),
+        })
+    if scenario == "blaser":
+        table.append({
+            "drug": fos.drug_name,
+            "component": f"extra q{fos.dosing_interval_min / 60:g}h infusion",
+            "amount_mg": fos.extra_dose_mg,
+            "daily_amount_mg": fos.extra_dose_mg * 24 / (fos.dosing_interval_min / 60),
+            "note": (
+                f"{fos.extra_infusion_ml_min * fos.infusion_duration_min:g} mL over {fos.infusion_duration_min / 60:g} h "
+                f"at {fos.extra_stock_mg_ml:g} mg/mL; into the extra compartment at the same time as the central dose"
             ),
         })
     if scenario == "overflow":

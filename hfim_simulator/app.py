@@ -17,6 +17,7 @@ from .pk import (
     half_life_for_flow,
     intermittent_peak_trough,
     simulate_hfim,
+    solve_blaser_setup,
     solve_css_cmax_replacement,
     solve_two_phase_replacement,
 )
@@ -50,6 +51,7 @@ def main() -> None:
     st.navigation([
         st.Page(_page_two_half_life, title="2 half life", url_path="two-half-life", default=True),
         st.Page(_page_one_half_life, title="1 half life", url_path="one-half-life"),
+        st.Page(_page_blaser, title="2 half life - Blaser", url_path="blaser"),
     ]).run()
 
 
@@ -2679,6 +2681,410 @@ def _equation_text(
             f"   Extra volume per 24 h = Qextra inlet x 1440 = {q_extra_diluent:.6g} x 1440 = {extra_daily_volume:.1f} mL",
             f"   Extra volume per 24 h with 10% extra = {extra_daily_volume:.1f} x 1.10 = {extra_daily_volume * 1.10:.1f} mL",
         ])
+    return "```text\n" + "\n".join(lines) + "\n```"
+
+
+# ---------------------------------------------------------------------------
+# "2 half life - Blaser" page: the long-half-life drug gets its true half-life from
+# a diluted extra compartment (Blaser design), dosed into central and extra at once.
+# Every pump is set once: the two outflow pumps run slightly above the continuous
+# inflow so they carry away the dose volumes, and nothing is touched during the run.
+# ---------------------------------------------------------------------------
+
+
+def _page_blaser() -> None:
+    import streamlit as st
+
+    st.title("HFIM PK Simulator - 2 half life (Blaser)")
+    st.caption(
+        "Two different half-lives with the true curve shape: the longer-half-life drug is dosed into central and an "
+        "extra compartment together, and the extra compartment is diluted so both fall at that drug's own half-life. "
+        "Every pump is set once for the whole run. Use this page when trough or T>MIC matters, or when the "
+        "2 half life page reports a deviation above its limit."
+    )
+
+    st.subheader("1. Simulation setup")
+    setup_cols = st.columns(3)
+    active_drug_count = int(setup_cols[0].number_input(
+        "Number of drugs",
+        min_value=2,
+        max_value=6,
+        value=3,
+        step=1,
+        help="One selected drug uses the central + extra setup; the others are dosed into central only and share the central washout.",
+    ))
+    duration_h = setup_cols[1].number_input("Simulation duration (h)", min_value=24.0, value=168.0, step=24.0, key="bl_duration")
+    dt_min = setup_cols[2].number_input("Time step (min)", min_value=0.25, value=1.0, step=0.25, key="bl_dt")
+    short_half_life_h = _shared_central_half_life_from_widget_state(active_drug_count, st.session_state)
+
+    with st.expander("Compartment settings", expanded=True):
+        st.markdown(
+            "Only the central volumes are entered. Flows and the extra-compartment volume are not free choices here: "
+            "they follow from the two half-lives and the central volume."
+        )
+        volume_cols = st.columns(3)
+        central_bottle_ml = volume_cols[0].number_input("Central bottle (mL)", min_value=1.0, value=100.0, step=1.0, key="bl_central")
+        cartridge_ml = volume_cols[1].number_input("Cartridge (mL)", min_value=0.0, value=70.0, step=1.0, key="bl_cartridge")
+        recirculation_ml_min = volume_cols[2].number_input(
+            "Cartridge recirculation (mL/min)", min_value=0.0, value=120.0, step=5.0, key="bl_recirculation"
+        )
+
+    st.subheader("2. Drug targets and injection settings")
+    st.caption("The shortest half-life entered here sets the central washout. One longer-half-life drug is then chosen for the extra compartment in Section 3.")
+    drug_inputs = _drug_input_panel(st, active_drug_count)
+
+    st.subheader("3. Long half-life drug: central + extra dosing")
+    setup_drug_names = list(drug_inputs.keys())
+    default_setup_index = max(
+        range(len(setup_drug_names)), key=lambda index: drug_inputs[setup_drug_names[index]]["half_life_h"]
+    )
+    setup_drug_name = st.selectbox(
+        "Drug that uses the extra compartment", setup_drug_names, index=default_setup_index, key="bl_setup_drug"
+    )
+    setup_values = drug_inputs[setup_drug_name]
+    dose_cols = st.columns(5)
+    target_css_mg_l = dose_cols[0].number_input(
+        "Target Css / Cavg (mg/L)", min_value=0.0, value=setup_values["target_concentration_mg_l"], step=5.0, key="bl_target"
+    )
+    central_dose_volume_ml = dose_cols[1].number_input("Central dose volume (mL)", min_value=0.1, value=6.0, step=0.5, key="bl_central_volume")
+    extra_dose_volume_ml = dose_cols[2].number_input("Extra dose volume (mL)", min_value=0.1, value=6.0, step=0.5, key="bl_extra_volume")
+    infusion_duration_h = dose_cols[3].number_input(
+        "Infusion duration (h)", min_value=0.01, value=float(setup_values.get("maintenance_duration_h") or 1.0), step=0.25, key="bl_infusion"
+    )
+    dosing_frequency_h = dose_cols[4].number_input(
+        "Dosing frequency (h)", min_value=0.1, value=float(setup_values["dosing_frequency_h"] or 6.0), step=1.0, key="bl_frequency"
+    )
+    infusion_min = int(round(infusion_duration_h * 60))
+    interval_min = int(round(dosing_frequency_h * 60))
+
+    setup = solve_blaser_setup(
+        central_bottle_ml,
+        cartridge_ml,
+        short_half_life_h,
+        setup_values["half_life_h"],
+        target_css_mg_l,
+        central_dose_volume_ml,
+        extra_dose_volume_ml,
+        infusion_min,
+        interval_min,
+        drug_name=setup_drug_name,
+        dt_min=dt_min,
+        duration_h=duration_h,
+    )
+    if setup.central_stock_mg_ml <= 0:
+        st.error(setup.message)
+        return
+
+    pump_cols = st.columns(4)
+    pump_cols[0].metric("Extra diluent pump", f"{setup.q_extra_diluent_ml_min:.3f} mL/min")
+    pump_cols[1].metric("Extra to central pump", f"{setup.q_extra_to_central_ml_min:.3f} mL/min")
+    pump_cols[2].metric("Central diluent pump", f"{setup.q_central_diluent_ml_min:.3f} mL/min")
+    pump_cols[3].metric("Waste pump", f"{setup.q_waste_ml_min:.3f} mL/min")
+    solved_cols = st.columns(4)
+    solved_cols[0].metric("Extra compartment volume", f"{setup.extra_volume_ml:.1f} mL")
+    solved_cols[1].metric("Central dose syringe", f"{setup.central_stock_mg_ml:.6f} mg/mL")
+    solved_cols[2].metric("Extra dose syringe", f"{setup.extra_stock_mg_ml:.6f} mg/mL")
+    solved_cols[3].metric(
+        "Max deviation from true curve",
+        f"{setup.max_deviation_pct:.1f}%",
+        f"limit {setup.deviation_limit_pct:g}%",
+        delta_color="off",
+    )
+    steady_cols = st.columns(4)
+    steady_cols[0].metric("Steady-state Cavg", f"{setup.predicted_cavg_mg_l:.1f} mg/L")
+    steady_cols[1].metric(
+        "Steady-state Cmax", f"{setup.predicted_cmax_mg_l:.1f} mg/L", f"true curve {setup.reference_cmax_mg_l:.1f}", delta_color="off"
+    )
+    steady_cols[2].metric(
+        "Steady-state Cmin", f"{setup.predicted_cmin_mg_l:.1f} mg/L", f"true curve {setup.reference_cmin_mg_l:.1f}", delta_color="off"
+    )
+    steady_cols[3].metric(
+        "Achieved half-life", f"{setup.apparent_half_life_h:.2f} h", f"target {setup.long_half_life_h:g} h", delta_color="off"
+    )
+    if setup.feasible:
+        st.success(setup.message)
+    else:
+        st.warning(setup.message)
+    st.info(_blaser_setup_notes(setup, central_dose_volume_ml, extra_dose_volume_ml, dosing_frequency_h, duration_h))
+
+    system = SystemConfig(
+        central_bottle_ml=central_bottle_ml,
+        cartridge_ml=cartridge_ml,
+        extra_volume_ml=setup.extra_volume_ml,
+        q_extra_to_central_ml_min=setup.q_extra_to_central_ml_min,
+        q_extra_diluent_ml_min=setup.q_extra_diluent_ml_min,
+        q_central_diluent_ml_min=setup.q_central_diluent_ml_min,
+        q_waste_set_ml_min=setup.q_waste_ml_min,
+    )
+    fos = FosfomycinConfig(
+        drug_name=setup_drug_name,
+        central_stock_mg_ml=setup.central_stock_mg_ml,
+        extra_stock_mg_ml=setup.extra_stock_mg_ml,
+        central_infusion_ml_min=central_dose_volume_ml / infusion_min,
+        extra_infusion_ml_min=extra_dose_volume_ml / infusion_min,
+        infusion_duration_min=infusion_min,
+        dosing_interval_min=interval_min,
+        preload_extra_mg=0.0,
+    )
+    drugs = [
+        DrugConfig(
+            name,
+            target_concentration_mg_l=values["target_concentration_mg_l"],
+            half_life_h=values["half_life_h"],
+            dosing_mode=values["dosing_mode"],
+            loading_target_concentration_mg_l=values["loading_target_concentration_mg_l"],
+            loading_duration_h=values["loading_duration_h"],
+            loading_volume_ml=values["loading_volume_ml"],
+            intermittent_interval_h=values["dosing_frequency_h"] or 6.0,
+            intermittent_duration_h=values["maintenance_duration_h"],
+        )
+        for name, values in drug_inputs.items()
+        if name != setup_drug_name
+    ]
+    result = simulate_hfim("blaser", system, fos, drugs, duration_h=duration_h, dt_min=dt_min)
+    summary = result.summary[setup_drug_name]
+
+    st.subheader("4. Setup and pump settings")
+    apparatus_fig = _plot_two_half_life_apparatus(
+        _blaser_apparatus_view(system, fos, drug_inputs, result.summary, duration_h, recirculation_ml_min, setup)
+    )
+    st.image(_figure_export_bytes(apparatus_fig, "png", dpi=300), width="stretch")
+    st.caption(
+        "Volumes on the waste and diluent bottles are totals for the whole run. The central compartment is "
+        "magnetically stirred. Both outflow tubes sit near the bottom of their bottle, and both bottles are vented."
+    )
+    _render_schematic_export_buttons(st, apparatus_fig, "apparatus_blaser", "hfim-apparatus-blaser")
+    st.markdown("**Pump settings (set once, never changed during the run)**")
+    st.dataframe(_blaser_pump_rows(setup, duration_h), width="stretch", hide_index=True, column_config={"Why": st.column_config.Column(width="large")})
+
+    st.subheader("5. Result overview")
+    target_auc = target_css_mg_l * 24
+    result_cols = st.columns(4)
+    result_cols[0].metric("Steady-state AUC per 24 h", f"{summary['central_auc_last_24h_mg_h_l']:.1f}", f"target {target_auc:g}")
+    result_cols[1].metric(
+        "Steady-state Cmax", f"{summary['central_cmax_last_24h_mg_l']:.1f} mg/L", f"true curve {setup.reference_cmax_mg_l:.1f}", delta_color="off"
+    )
+    result_cols[2].metric(
+        "Steady-state Cmin", f"{summary['central_cmin_last_24h_mg_l']:.1f} mg/L", f"true curve {setup.reference_cmin_mg_l:.1f}", delta_color="off"
+    )
+    result_cols[3].metric("AUC0-24 (first day)", f"{summary['central_auc_0_24_mg_h_l']:.1f}")
+    st.caption(
+        "Steady-state values come from the last 24 h of the run. The first day is lower because the drug is still "
+        "accumulating, exactly as it would in a patient starting the same regimen."
+        + ("" if duration_h >= 48 else " Run at least 48 h to see the settled values.")
+    )
+
+    st.subheader("6. PK concentration")
+    st.pyplot(_plot_static(
+        result.rows,
+        [setup_drug_name],
+        f"{setup_drug_name} central and extra concentration",
+        include_extra=True,
+        reference=_true_one_compartment_curve(target_css_mg_l, setup.long_half_life_h, interval_min, infusion_min, duration_h, dt_min),
+    ))
+    st.caption(
+        f"Dotted line: the true one-compartment curve for a {setup.long_half_life_h:g} h half-life with the same dose "
+        "timing. Central and extra are dosed together and fall together, which is what gives central the longer half-life."
+    )
+    central_drugs = [drug.name for drug in drugs]
+    if central_drugs:
+        st.pyplot(_plot_static(result.rows, central_drugs, "Central concentration for loading/infusion drugs", include_extra=False))
+        st.caption(
+            "Small ripple on continuous-infusion drugs comes from central volume rising and settling by "
+            f"{setup.central_volume_range_ml[1] - setup.central_volume_range_ml[0]:.1f} mL around each dose."
+        )
+
+    st.subheader("7. Preparation and weighing plan")
+    st.markdown(f"**{setup_drug_name} dose syringes**")
+    st.dataframe(
+        _blaser_dose_rows(setup, fos, central_dose_volume_ml, extra_dose_volume_ml, duration_h),
+        width="stretch",
+        hide_index=True,
+    )
+    st.markdown("**Solutions to prepare**")
+    st.dataframe(
+        [
+            _solution_volume_row("Central diluent", setup.q_central_diluent_ml_min, duration_h),
+            _solution_volume_row("Extra diluent", setup.q_extra_diluent_ml_min, duration_h),
+        ],
+        width="stretch",
+        hide_index=True,
+    )
+    central_diluent_ci_rows = _central_diluent_reservoir_rows(result.summary, duration_h)
+    if central_diluent_ci_rows:
+        st.markdown("**Central diluent q24h shared reservoir recipe**")
+        st.caption("Continuous-infusion drugs are mixed into the central diluent reservoir, which is replaced every 24 h.")
+        st.dataframe(central_diluent_ci_rows, width="stretch", hide_index=True, column_config={"Note": st.column_config.Column(width="large")})
+    other_prep = [
+        row for row in _format_preparation_rows(result.summary["drug_preparation"]) if row["Drug"] != setup_drug_name
+    ]
+    if other_prep:
+        st.markdown(f"**{_prep_group_title(other_prep)}**")
+        st.dataframe(other_prep, width="stretch", hide_index=True, column_config={"Note": st.column_config.Column(width="large")})
+
+    st.subheader("8. Equations")
+    st.markdown(_blaser_equation_text(setup, central_dose_volume_ml, extra_dose_volume_ml, infusion_min, interval_min))
+
+
+def _blaser_setup_notes(setup, central_dose_volume_ml: float, extra_dose_volume_ml: float, interval_h: float, duration_h: float) -> str:
+    central_low, central_high = setup.central_volume_range_ml
+    extra_low, extra_high = setup.extra_volume_range_ml
+    return (
+        f"Why two pumps are set above the textbook values: each q{interval_h:g}h dose adds {central_dose_volume_ml:g} mL to central "
+        f"and {extra_dose_volume_ml:g} mL to extra. With the textbook flows ({setup.uncorrected_q_extra_to_central_ml_min:.3f} and "
+        f"{setup.uncorrected_q_waste_ml_min:.3f} mL/min) that volume is never removed: after {duration_h:g} h the vessels would hold "
+        f"{setup.uncorrected_end_volumes_ml[0]:.0f} mL and {setup.uncorrected_end_volumes_ml[1]:.0f} mL and the curve would be "
+        f"{setup.uncorrected_end_deviation_pct:.0f}% off. Here the extra-to-central pump and the waste pump are set once to also "
+        f"carry the dose volume, averaged over the interval. Central then moves between {central_low:.0f} and {central_high:.0f} mL "
+        f"and extra between {extra_low:.0f} and {extra_high:.0f} mL each interval, and returns to the start every time. "
+        f"Doses are {(setup.dose_scale - 1) * 100:+.1f}% versus the textbook amounts to keep the daily AUC exact. "
+        "Bench notes: keep both outflow tubes near the bottom of the bottle, vent both bottles, leave headroom for the rise, "
+        "and mark the starting liquid level so pump drift shows up early."
+    )
+
+
+def _blaser_pump_rows(setup, duration_h: float) -> list[dict]:
+    def row(name: str, flow: float, textbook: float, why: str) -> dict:
+        return {
+            "Pump": name,
+            "Set to": f"{flow:.3f} mL/min ({flow * 60:.2f} mL/h)",
+            "Textbook Blaser": f"{textbook:.3f} mL/min",
+            f"Volume in {duration_h:g} h": f"{flow * duration_h * 60:,.0f} mL",
+            "Why": why,
+        }
+
+    return [
+        row("Extra diluent -> extra", setup.q_extra_diluent_ml_min, setup.q_extra_diluent_ml_min,
+            "washes the extra compartment out at the long half-life"),
+        row("Extra -> central", setup.q_extra_to_central_ml_min, setup.uncorrected_q_extra_to_central_ml_min,
+            "extra diluent flow plus the extra dose volume averaged over the dosing interval"),
+        row("Central diluent -> central", setup.q_central_diluent_ml_min, setup.q_central_diluent_ml_min,
+            "the rest of the inflow needed for the short central half-life; continuous-infusion drugs are mixed into it"),
+        row("Central -> waste", setup.q_waste_ml_min, setup.uncorrected_q_waste_ml_min,
+            "all continuous inflow plus both dose volumes averaged over the dosing interval"),
+    ]
+
+
+def _blaser_dose_rows(setup, fos: FosfomycinConfig, central_dose_volume_ml: float, extra_dose_volume_ml: float, duration_h: float) -> list[dict]:
+    interval_h = fos.dosing_interval_min / 60
+    duration_infusion_h = fos.infusion_duration_min / 60
+    doses_per_day = 24 / interval_h
+    total_doses = math.ceil(duration_h / interval_h)
+
+    def row(destination: str, dose_mg: float, volume_ml: float, concentration: float) -> dict:
+        return {
+            "Into": destination,
+            "Timing": f"q{interval_h:g}h, {volume_ml:g} mL over {duration_infusion_h:g} h ({volume_ml / duration_infusion_h:.2f} mL/h)",
+            "Syringe concentration": f"{concentration:.6f} mg/mL",
+            "Per dose": f"{dose_mg:.3f} mg",
+            "Per day": f"{dose_mg * doses_per_day:.3f} mg in {volume_ml * doses_per_day:g} mL",
+            "Per day +10%": f"{dose_mg * doses_per_day * 1.10:.3f} mg in {volume_ml * doses_per_day * 1.10:.1f} mL",
+            f"{duration_h:g} h total +10%": f"{dose_mg * total_doses * 1.10:.1f} mg in {volume_ml * total_doses * 1.10:.1f} mL",
+        }
+
+    return [
+        row("Central compartment", setup.central_dose_mg, central_dose_volume_ml, setup.central_stock_mg_ml),
+        row("Extra compartment (same time)", setup.extra_dose_mg, extra_dose_volume_ml, setup.extra_stock_mg_ml),
+    ]
+
+
+def _blaser_apparatus_view(
+    system: SystemConfig,
+    fos: FosfomycinConfig,
+    drug_inputs: dict,
+    summary: dict,
+    duration_h: float,
+    recirculation_ml_min: float,
+    setup,
+) -> dict:
+    interval_h = fos.dosing_interval_min / 60
+    infusion_h = fos.infusion_duration_min / 60
+    central_volume_ml = fos.central_infusion_ml_min * fos.infusion_duration_min
+    extra_volume_ml = fos.extra_infusion_ml_min * fos.infusion_duration_min
+    central_groups = [(
+        f"{fos.drug_name} central q{interval_h:g}h",
+        [
+            f"hour 0-{infusion_h:g} of every q{interval_h:g}h dose",
+            f"{fos.central_infusion_ml_min * 60:.2f} mL/h",
+            f"{fos.central_dose_mg:.2f} mg in {central_volume_ml:g} mL",
+            f"syringe {fos.central_stock_mg_ml:.2f} mg/mL",
+        ],
+    )]
+    central_groups.extend(_central_drug_apparatus_groups(drug_inputs, summary, skip=fos.drug_name))
+    extra_groups = [(
+        f"{fos.drug_name} extra q{interval_h:g}h",
+        [
+            "same time as the central dose",
+            f"{fos.extra_infusion_ml_min * 60:.2f} mL/h",
+            f"{fos.extra_dose_mg:.2f} mg in {extra_volume_ml:g} mL",
+            f"syringe {fos.extra_stock_mg_ml:.2f} mg/mL",
+            f"central + extra: {(fos.central_dose_mg + fos.extra_dose_mg) * 24 / interval_h:.2f} mg/day",
+        ],
+    )]
+    return {
+        "title": "HFIM apparatus - 2 half life (Blaser)",
+        "subtitle": (
+            f"{fos.drug_name} at {setup.long_half_life_h:g} h via the extra compartment   |   central washout "
+            f"{setup.short_half_life_h:g} h   |   {duration_h:g} h run"
+        ),
+        "cartridge_volume": f"{system.cartridge_ml:g} mL",
+        "central_volume": f"{system.central_bottle_ml:g} mL",
+        "extra_volume": f"{system.extra_volume_ml:.0f} mL",
+        "waste_total": f"{system.q_waste_ml_min * duration_h * 60:,.0f} mL",
+        "central_diluent_total": f"{system.q_central_diluent_ml_min * duration_h * 60:,.0f} mL",
+        "extra_diluent_total": f"{system.q_extra_diluent_ml_min * duration_h * 60:,.0f} mL",
+        "recirculation": f"{recirculation_ml_min:g} mL/min",
+        "waste_flow": f"{system.q_waste_ml_min:.3f} mL/min",
+        "extra_to_central_flow": f"{system.q_extra_to_central_ml_min:.3f} mL/min",
+        "central_diluent_flow": f"{system.q_central_diluent_ml_min:.3f} mL/min",
+        "extra_diluent_flow": f"{system.q_extra_diluent_ml_min:.3f} mL/min",
+        "show_extra_diluent": True,
+        "central_injection_groups": central_groups,
+        "extra_injection_groups": extra_groups,
+    }
+
+
+def _blaser_equation_text(setup, central_dose_volume_ml: float, extra_dose_volume_ml: float, infusion_min: int, interval_min: int) -> str:
+    vc = setup.central_volume_ml
+    interval_h = interval_min / 60
+    q_short = setup.uncorrected_q_waste_ml_min
+    lines = [
+        "1. Textbook Blaser flows (two half-lives, fixed volumes)",
+        f"   Vc = central bottle + cartridge = {vc:g} mL",
+        f"   Q_short = ln(2) x Vc / (short t1/2 x 60) = ln(2) x {vc:g} / ({setup.short_half_life_h:g} x 60) = {q_short:.6g} mL/min",
+        f"   Q_long  = ln(2) x Vc / (long t1/2 x 60)  = ln(2) x {vc:g} / ({setup.long_half_life_h:g} x 60) = {setup.q_central_diluent_ml_min:.6g} mL/min",
+        f"   Central diluent pump = Q_long = {setup.q_central_diluent_ml_min:.6g} mL/min",
+        f"   Extra diluent pump   = Q_short - Q_long = {setup.q_extra_diluent_ml_min:.6g} mL/min",
+        f"   Extra volume = Vc x (Q_short - Q_long) / Q_long = {setup.extra_volume_ml:.1f} mL",
+        "   With these, extra washes out at the long half-life and central follows it for the dosed drug,",
+        "   while drugs dosed into central only still wash out at the short half-life.",
+        "",
+        "2. Outflow pumps, set once to also remove the dose volumes",
+        f"   Extra dose flow averaged over the interval   = {extra_dose_volume_ml:g} mL / {interval_min:g} min = {extra_dose_volume_ml / interval_min:.6g} mL/min",
+        f"   Central dose flow averaged over the interval = {central_dose_volume_ml:g} mL / {interval_min:g} min = {central_dose_volume_ml / interval_min:.6g} mL/min",
+        f"   Extra -> central pump = {setup.q_extra_diluent_ml_min:.6g} + {extra_dose_volume_ml / interval_min:.6g} = {setup.q_extra_to_central_ml_min:.6g} mL/min",
+        f"   Waste pump = {q_short:.6g} + {central_dose_volume_ml / interval_min:.6g} + {extra_dose_volume_ml / interval_min:.6g} = {setup.q_waste_ml_min:.6g} mL/min",
+        "   Over one interval each vessel gains its dose volume during the infusion and loses the same",
+        "   volume afterwards, so nothing accumulates.",
+        "",
+        "3. Doses",
+        f"   Concentration step per dose = Cavg x ln(2) / long t1/2 x interval = {setup.target_css_mg_l:g} x ln(2) / {setup.long_half_life_h:g} x {interval_h:g}",
+        "   Textbook central dose = step x Vc;  textbook extra dose = step x extra volume (same step in both)",
+        f"   Scale so simulated steady-state Cavg = target: x {setup.dose_scale:.4f}",
+        f"   Central dose = {setup.central_dose_mg:.3f} mg in {central_dose_volume_ml:g} mL = {setup.central_stock_mg_ml:.6g} mg/mL",
+        f"   Extra dose   = {setup.extra_dose_mg:.3f} mg in {extra_dose_volume_ml:g} mL = {setup.extra_stock_mg_ml:.6g} mg/mL",
+        "",
+        "4. Continuous-infusion drugs in the central diluent",
+        "   CI input mg/min = Css x waste pump / 1000",
+        "   Central diluent concentration = CI input mg/min / central diluent pump",
+        "",
+        "5. Differential equations used during each time step",
+        "   dAextra/dt   = extra dose input - Q(extra->central) x Cextra",
+        "   dAcentral/dt = central dose input + Q(extra->central) x Cextra - Q(waste) x Ccentral",
+        "   dVextra/dt   = extra diluent + extra dose flow - Q(extra->central)",
+        "   dVcentral/dt = Q(extra->central) + central diluent + central dose flow - Q(waste)",
+        "   C = A / V with the volume of that moment",
+    ]
     return "```text\n" + "\n".join(lines) + "\n```"
 
 

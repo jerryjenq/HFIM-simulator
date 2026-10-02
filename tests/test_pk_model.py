@@ -11,6 +11,7 @@ from hfim_simulator.pk import (
     intermittent_peak_trough,
     one_compartment_steady_state_profile,
     simulate_hfim,
+    solve_blaser_setup,
     solve_css_cmax_replacement,
     solve_two_phase_replacement,
 )
@@ -815,6 +816,142 @@ class TwoPhaseReplacementTest(unittest.TestCase):
 
         self.assertFalse(solution.feasible)
         self.assertEqual(solution.central_stock_mg_ml, 0.0)
+
+
+def _blaser_system_and_fos(setup, central_volume_ml: float = 6, extra_volume_ml: float = 6, duration_min: int = 60, interval_min: int = 360):
+    system = SystemConfig(
+        central_bottle_ml=100,
+        cartridge_ml=70,
+        extra_volume_ml=setup.extra_volume_ml,
+        q_extra_to_central_ml_min=setup.q_extra_to_central_ml_min,
+        q_extra_diluent_ml_min=setup.q_extra_diluent_ml_min,
+        q_central_diluent_ml_min=setup.q_central_diluent_ml_min,
+        q_waste_set_ml_min=setup.q_waste_ml_min,
+    )
+    fos = FosfomycinConfig(
+        central_stock_mg_ml=setup.central_stock_mg_ml,
+        extra_stock_mg_ml=setup.extra_stock_mg_ml,
+        central_infusion_ml_min=central_volume_ml / duration_min,
+        extra_infusion_ml_min=extra_volume_ml / duration_min,
+        infusion_duration_min=duration_min,
+        dosing_interval_min=interval_min,
+        preload_extra_mg=0.0,
+    )
+    return system, fos
+
+
+class BlaserSetupTest(unittest.TestCase):
+    def test_textbook_flows_and_extra_volume_for_default_half_lives(self):
+        setup = solve_blaser_setup(100, 70, 1.25, 3, 150, 6, 6, 60, 360)
+
+        self.assertAlmostEqual(setup.uncorrected_q_waste_ml_min, flow_for_half_life(170, 1.25), places=9)
+        self.assertAlmostEqual(setup.q_central_diluent_ml_min, flow_for_half_life(170, 3), places=9)
+        self.assertAlmostEqual(setup.q_extra_diluent_ml_min, 0.9165, places=4)
+        self.assertAlmostEqual(setup.extra_volume_ml, 238.0, places=6)
+        # The extra compartment washes out at the long half-life.
+        self.assertAlmostEqual(half_life_for_flow(setup.extra_volume_ml, setup.q_extra_diluent_ml_min), 3.0, places=9)
+
+    def test_outflow_pumps_carry_the_dose_volume_averaged_over_the_interval(self):
+        setup = solve_blaser_setup(100, 70, 1.25, 3, 150, 6, 6, 60, 360)
+
+        self.assertAlmostEqual(setup.q_extra_to_central_ml_min, setup.q_extra_diluent_ml_min + 6 / 360, places=9)
+        self.assertAlmostEqual(setup.q_waste_ml_min, flow_for_half_life(170, 1.25) + 12 / 360, places=9)
+
+    def test_default_setup_tracks_the_true_curve_with_exact_cavg(self):
+        setup = solve_blaser_setup(100, 70, 1.25, 3, 150, 6, 6, 60, 360)
+
+        self.assertTrue(setup.feasible)
+        self.assertLess(setup.max_deviation_pct, 1.5)
+        self.assertAlmostEqual(setup.predicted_cavg_mg_l, 150, places=6)
+        self.assertAlmostEqual(setup.apparent_half_life_h, 3.0, delta=0.08)
+        self.assertAlmostEqual(setup.predicted_cmin_mg_l, setup.reference_cmin_mg_l, delta=1.5)
+        self.assertAlmostEqual(setup.dose_scale, 1.021, places=3)
+        self.assertAlmostEqual(setup.central_dose_mg, 36.10, places=2)
+        self.assertAlmostEqual(setup.extra_dose_mg, 50.54, places=2)
+
+    def test_volumes_rise_by_the_dose_and_return_every_interval_without_drift(self):
+        setup = solve_blaser_setup(100, 70, 1.25, 3, 150, 6, 6, 60, 360)
+        system, fos = _blaser_system_and_fos(setup)
+        result = simulate_hfim("blaser", system, fos, [], duration_h=168, dt_min=1)
+        rows = result.rows
+        at_dose_start = [row for row in rows if row["time_min"] % 360 == 0]
+
+        for row in at_dose_start:
+            self.assertAlmostEqual(row["central_volume_ml"], 170, places=6)
+            self.assertAlmostEqual(row["extra_volume_ml"], 238, places=6)
+        self.assertAlmostEqual(max(row["central_volume_ml"] for row in rows), 175, places=6)
+        self.assertAlmostEqual(max(row["extra_volume_ml"] for row in rows), 243, places=6)
+        self.assertAlmostEqual(setup.central_volume_range_ml[1] - setup.central_volume_range_ml[0], 5, places=6)
+
+    def test_full_run_holds_steady_state_auc_and_half_life_through_day_seven(self):
+        setup = solve_blaser_setup(100, 70, 1.25, 3, 150, 6, 6, 60, 360)
+        system, fos = _blaser_system_and_fos(setup)
+        result = simulate_hfim("blaser", system, fos, [], duration_h=168, dt_min=1)
+        summary = result.summary["fosfomycin"]
+        rows = result.rows
+
+        def daily_auc(day: int) -> float:
+            day_rows = [row for row in rows if day * 24 <= row["time_h"] <= (day + 1) * 24]
+            return sum(
+                (a["central_mg_l"] + b["central_mg_l"]) * 0.5 * (b["time_h"] - a["time_h"])
+                for a, b in zip(day_rows, day_rows[1:])
+            )
+
+        self.assertAlmostEqual(summary["central_auc_last_24h_mg_h_l"], 3600, delta=1.5)
+        # No drift: day 3 and day 7 give the same exposure.
+        self.assertAlmostEqual(daily_auc(2), daily_auc(6), delta=0.5)
+        self.assertAlmostEqual(summary["central_cmin_last_24h_mg_l"], setup.predicted_cmin_mg_l, delta=0.05)
+
+    def test_published_flows_without_the_pump_correction_drift_badly(self):
+        setup = solve_blaser_setup(100, 70, 1.25, 3, 150, 6, 6, 60, 360, duration_h=168)
+
+        self.assertGreater(setup.uncorrected_end_deviation_pct, 30)
+        self.assertAlmostEqual(setup.uncorrected_end_volumes_ml[0], 170 + 28 * 6, delta=0.5)
+        self.assertAlmostEqual(setup.uncorrected_end_volumes_ml[1], 238 + 28 * 6, delta=0.5)
+
+    def test_continuous_infusion_drug_still_averages_its_target(self):
+        setup = solve_blaser_setup(100, 70, 1.25, 3, 150, 6, 6, 60, 360)
+        system, fos = _blaser_system_and_fos(setup)
+        imipenem = DrugConfig("imipenem", 9, 1.25, dosing_mode="continuous infusion only")
+        result = simulate_hfim("blaser", system, fos, [imipenem], duration_h=168, dt_min=1)
+        late = [row["central_mg_l"] for row in result.rows if row["drug"] == "imipenem" and row["time_h"] >= 144]
+
+        self.assertAlmostEqual(sum(late) / len(late), 9, delta=0.05)
+        self.assertGreater(min(late), 8.7)
+        self.assertLess(max(late), 9.2)
+        # Reservoir concentration uses the waste pump setting, not the textbook outflow.
+        expected = 9 / 1000 * setup.q_waste_ml_min / setup.q_central_diluent_ml_min
+        self.assertAlmostEqual(result.summary["imipenem"]["central_diluent_concentration_mg_ml"], expected, places=9)
+
+    def test_preparation_table_lists_central_and_extra_doses(self):
+        setup = solve_blaser_setup(100, 70, 1.25, 3, 150, 6, 6, 60, 360)
+        system, fos = _blaser_system_and_fos(setup)
+        prep = simulate_hfim("blaser", system, fos, [], duration_h=24, dt_min=1).summary["drug_preparation"]
+        components = {row["component"]: row for row in prep}
+
+        self.assertAlmostEqual(components["central q6h infusion"]["amount_mg"], setup.central_dose_mg, places=9)
+        self.assertAlmostEqual(components["extra q6h infusion"]["amount_mg"], setup.extra_dose_mg, places=9)
+
+    def test_drug_no_longer_than_central_washout_is_rejected_with_guidance(self):
+        setup = solve_blaser_setup(100, 70, 1.25, 1.25, 150, 6, 6, 60, 360)
+
+        self.assertFalse(setup.feasible)
+        self.assertEqual(setup.central_stock_mg_ml, 0.0)
+        self.assertIn("1 half life page", setup.message)
+
+    def test_other_half_life_pairs_and_intervals_stay_close(self):
+        for short, long, interval in [(1.0, 6, 720), (2.0, 8, 720), (1.0, 2, 480), (1.25, 3, 720), (1.0, 12, 1440)]:
+            setup = solve_blaser_setup(100, 70, short, long, 150, 6, 6, 60, interval)
+            with self.subTest(short=short, long=long, interval=interval):
+                self.assertTrue(setup.feasible)
+                self.assertLess(setup.max_deviation_pct, 4)
+                self.assertAlmostEqual(setup.predicted_cavg_mg_l, 150, places=6)
+
+    def test_existing_scenarios_keep_inflow_equals_outflow_waste(self):
+        system = SystemConfig()
+
+        self.assertIsNone(system.q_waste_set_ml_min)
+        self.assertAlmostEqual(system.q_waste_ml_min, system.q_extra_to_central_ml_min + system.q_central_diluent_ml_min, places=12)
 
 
 if __name__ == "__main__":
