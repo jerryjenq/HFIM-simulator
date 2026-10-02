@@ -9,8 +9,10 @@ from hfim_simulator.pk import (
     flow_for_half_life,
     half_life_for_flow,
     intermittent_peak_trough,
+    one_compartment_steady_state_profile,
     simulate_hfim,
     solve_css_cmax_replacement,
+    solve_two_phase_replacement,
 )
 
 
@@ -690,6 +692,129 @@ class HfimPkModelTest(unittest.TestCase):
         self.assertIn("testdrug", result.summary)
         self.assertNotIn("fosfomycin", {row["drug"] for row in result.rows})
         self.assertTrue(all(row["drug"] == "testdrug" for row in result.rows))
+
+
+def _two_phase_default_system() -> SystemConfig:
+    # Website defaults: 170 mL central, washout set by the 1.25 h drugs, Qextra 0.167 mL/min.
+    q_waste = flow_for_half_life(170, 1.25)
+    return SystemConfig(
+        central_bottle_ml=100,
+        cartridge_ml=70,
+        extra_volume_ml=241,
+        q_extra_to_central_ml_min=0.167,
+        q_extra_diluent_ml_min=0.0,
+        q_central_diluent_ml_min=q_waste - 0.167,
+    )
+
+
+def _two_phase_fos(solution, interval_min: int = 360, duration_min: int = 60) -> FosfomycinConfig:
+    return FosfomycinConfig(
+        central_stock_mg_ml=solution.central_stock_mg_ml,
+        extra_stock_mg_ml=solution.extra_replacement_concentration_mg_ml,
+        central_infusion_ml_min=0.1,
+        extra_infusion_ml_min=0.0,
+        infusion_duration_min=duration_min,
+        dosing_interval_min=interval_min,
+        preload_extra_mg=0.0,
+        slow_stock_mg_ml=solution.slow_stock_mg_ml,
+        slow_infusion_ml_min=solution.slow_infusion_ml_min,
+        slow_duration_min=solution.slow_duration_min,
+    )
+
+
+class TwoPhaseReplacementTest(unittest.TestCase):
+    def test_reference_profile_matches_closed_form_peak_trough_and_average(self):
+        profile = one_compartment_steady_state_profile(150, 3, 360, 60, dt_min=1)
+        cmax, cmin = intermittent_peak_trough(150, 3, 6, 1)
+
+        self.assertEqual(len(profile), 360)
+        self.assertAlmostEqual(profile[60], cmax, places=6)
+        self.assertAlmostEqual(profile[0], cmin, places=6)
+        self.assertAlmostEqual(cmax, 247.56, places=2)
+        self.assertAlmostEqual(cmin, 77.98, places=2)
+        self.assertAlmostEqual(sum(profile) / len(profile), 150, delta=0.2)
+
+    def test_default_setup_follows_the_three_hour_curve_within_limit(self):
+        solution = solve_two_phase_replacement(_two_phase_default_system(), "fosfomycin", 150, 3, 0.1, 60, 360)
+
+        self.assertTrue(solution.feasible)
+        self.assertLess(solution.max_deviation_pct, 6.5)
+        self.assertGreater(solution.single_phase_max_deviation_pct, 15)
+        self.assertAlmostEqual(solution.predicted_cavg_mg_l, 150, places=6)
+        self.assertAlmostEqual(solution.predicted_cmin_mg_l, solution.reference_cmin_mg_l, delta=3)
+        self.assertAlmostEqual(solution.predicted_cmax_mg_l, solution.reference_cmax_mg_l, delta=3)
+        self.assertEqual(solution.slow_duration_min, 150)
+        # Same concentration, separate syringe: the second pump just runs slower.
+        self.assertAlmostEqual(solution.slow_stock_mg_ml, solution.central_stock_mg_ml, places=9)
+        self.assertGreater(solution.slow_infusion_ml_min, 0)
+        self.assertLess(solution.slow_infusion_ml_min, 0.1)
+
+    def test_full_simulation_settles_onto_the_solved_profile_with_exact_daily_auc(self):
+        system = _two_phase_default_system()
+        solution = solve_two_phase_replacement(system, "fosfomycin", 150, 3, 0.1, 60, 360)
+        result = simulate_hfim("q24_replacement", system, _two_phase_fos(solution), [], duration_h=168, dt_min=1)
+        summary = result.summary["fosfomycin"]
+        last_interval = [row["central_mg_l"] for row in result.rows if 162 <= row["time_h"] < 168]
+
+        self.assertAlmostEqual(summary["central_auc_last_24h_mg_h_l"], 3600, delta=1)
+        self.assertAlmostEqual(summary["central_cmin_last_24h_mg_l"], solution.predicted_cmin_mg_l, places=2)
+        self.assertAlmostEqual(summary["central_cmax_last_24h_mg_l"], solution.predicted_cmax_mg_l, places=2)
+        for simulated, solved in zip(last_interval, solution.predicted_profile_mg_l):
+            self.assertAlmostEqual(simulated, solved, places=2)
+        # The first day is still filling up, so it sits below the settled daily exposure.
+        self.assertLess(summary["central_auc_0_24_mg_h_l"], summary["central_auc_last_24h_mg_h_l"])
+
+    def test_interval_much_longer_than_half_life_is_flagged_but_keeps_exact_auc(self):
+        solution = solve_two_phase_replacement(_two_phase_default_system(), "fosfomycin", 150, 3, 0.1, 60, 720)
+
+        self.assertFalse(solution.feasible)
+        self.assertGreater(solution.max_deviation_pct, 10)
+        self.assertIn("Blaser", solution.message)
+        self.assertAlmostEqual(solution.predicted_cavg_mg_l, 150, places=6)
+
+    def test_short_interval_relative_to_half_life_is_tracked_closely(self):
+        system = SystemConfig(100, 70, 241, 0.167, 0.0, flow_for_half_life(170, 2) - 0.167)
+        solution = solve_two_phase_replacement(system, "drug", 150, 8, 0.1, 180, 720)
+
+        self.assertTrue(solution.feasible)
+        self.assertLess(solution.max_deviation_pct, 8)
+
+    def test_separate_weaker_stock_at_a_fixed_slow_pump_rate(self):
+        solution = solve_two_phase_replacement(
+            _two_phase_default_system(), "fosfomycin", 150, 3, 0.1, 60, 360, slow_infusion_ml_min=0.1
+        )
+
+        self.assertAlmostEqual(solution.slow_infusion_ml_min, 0.1, places=9)
+        self.assertLess(solution.slow_stock_mg_ml, solution.central_stock_mg_ml)
+        self.assertLess(solution.max_deviation_pct, 6.5)
+        self.assertAlmostEqual(solution.predicted_cavg_mg_l, 150, places=6)
+
+    def test_slow_line_appears_in_preparation_table_with_delivered_amount(self):
+        system = _two_phase_default_system()
+        solution = solve_two_phase_replacement(system, "fosfomycin", 150, 3, 0.1, 60, 360)
+        fos = _two_phase_fos(solution)
+        result = simulate_hfim("q24_replacement", system, fos, [], duration_h=24, dt_min=1)
+        slow_rows = [row for row in result.summary["drug_preparation"] if "slow line" in row["component"]]
+
+        self.assertEqual(len(slow_rows), 1)
+        expected_mg = solution.slow_stock_mg_ml * solution.slow_infusion_ml_min * solution.slow_duration_min
+        self.assertAlmostEqual(slow_rows[0]["amount_mg"], expected_mg, places=9)
+        self.assertAlmostEqual(slow_rows[0]["daily_amount_mg"], expected_mg * 4, places=9)
+        self.assertEqual(slow_rows[0]["component"], "central q6h slow line (h 1-3.5)")
+
+    def test_setup_without_slow_line_is_unchanged(self):
+        fos = FosfomycinConfig()
+
+        self.assertFalse(fos.has_slow_line)
+        self.assertEqual(fos.slow_dose_mg, 0.0)
+        result = simulate_hfim("q24_replacement", SystemConfig(), fos, [], duration_h=24, dt_min=1)
+        self.assertFalse(any("slow line" in row["component"] for row in result.summary["drug_preparation"]))
+
+    def test_invalid_inputs_return_an_infeasible_result_instead_of_raising(self):
+        solution = solve_two_phase_replacement(_two_phase_default_system(), "fosfomycin", 150, 3, 0.1, 480, 360)
+
+        self.assertFalse(solution.feasible)
+        self.assertEqual(solution.central_stock_mg_ml, 0.0)
 
 
 if __name__ == "__main__":

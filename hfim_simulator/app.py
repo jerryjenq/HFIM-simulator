@@ -18,6 +18,7 @@ from .pk import (
     intermittent_peak_trough,
     simulate_hfim,
     solve_css_cmax_replacement,
+    solve_two_phase_replacement,
 )
 from .store import SimulationStore
 
@@ -230,9 +231,33 @@ def _page_two_half_life() -> None:
     st.markdown(_optimization_guidance_text(setup_drug_name, scenario))
     setup_drug_values = drug_inputs[setup_drug_name]
     if setup_drug_values:
+        two_phase = False
+        if scenario == "q24_replacement":
+            two_phase = st.checkbox(
+                f"Two-phase central dosing: add a slow second central line so {setup_drug_name} follows its own "
+                f"{setup_drug_values['half_life_h']:g} h half-life",
+                value=True,
+                help=(
+                    "Central washout is set by the shortest half-life, so a longer-half-life drug falls too fast after "
+                    "each infusion. With this on, a second central line runs slowly right after the main infusion and the "
+                    "extra-compartment concentration is lowered to match, so the whole curve tracks the true half-life "
+                    "instead of only matching AUC and Cmax. Turn it off for the original single-infusion AUC + Cmax solver."
+                ),
+            )
         target_cols = st.columns(3)
         target_css_mg_l = target_cols[0].number_input("Target Css / Cavg (mg/L)", min_value=0.0, value=setup_drug_values["target_concentration_mg_l"], step=5.0)
-        target_cmax_mg_l = target_cols[1].number_input("Target Cmax (mg/L)", min_value=0.0, value=250.0, step=5.0)
+        target_cmax_mg_l = target_cols[1].number_input(
+            "Target Cmax (mg/L)",
+            min_value=0.0,
+            value=250.0,
+            step=5.0,
+            disabled=two_phase,
+            help=(
+                "Not used in two-phase mode: Cmax follows from the half-life, dosing interval and infusion duration."
+                if two_phase
+                else None
+            ),
+        )
         if scenario == "q24_replacement":
             reservoir_replacement_interval_h = target_cols[2].number_input("Extra replacement interval (h)", min_value=0.1, value=24.0, step=1.0)
         else:
@@ -277,22 +302,61 @@ def _page_two_half_life() -> None:
             duration_h=duration_h,
             dt_min=dt_min,
         )
-        setup_cols[3].metric("Solved central stock", f"{solver_result.central_stock_mg_ml:.6f} mg/mL")
-        fos_central_stock = solver_result.central_stock_mg_ml
+        two_phase_result = None
+        if two_phase:
+            slow_cols = st.columns(2)
+            slow_source = slow_cols[0].selectbox(
+                "Slow line source",
+                [_SLOW_LINE_SAME_STOCK, _SLOW_LINE_SEPARATE_STOCK],
+                help=(
+                    "The slow line always has its own syringe on a second pump. Same concentration: fill that syringe "
+                    "with solution at the main-infusion concentration and run it at the solved low rate. "
+                    "Weaker concentration: keep the pump at a rate you choose and prepare a more dilute solution instead."
+                ),
+            )
+            slow_line_fixed_rate_ml_min = None
+            if slow_source == _SLOW_LINE_SEPARATE_STOCK:
+                slow_line_fixed_rate_ml_min = slow_cols[1].number_input(
+                    "Slow line pump rate (mL/h)", min_value=0.01, value=6.0, step=0.5
+                ) / 60
+            two_phase_result = solve_two_phase_replacement(
+                q24_system,
+                setup_drug_name,
+                target_css_mg_l,
+                setup_drug_values["half_life_h"],
+                fos_central_rate,
+                fos_duration,
+                fos_interval,
+                slow_infusion_ml_min=slow_line_fixed_rate_ml_min,
+                dt_min=dt_min,
+                slow_duration_step_min=30 if fos_interval <= 720 else 60,
+            )
+        two_phase_active = two_phase_result is not None and two_phase_result.central_stock_mg_ml > 0
+        fos_central_stock = two_phase_result.central_stock_mg_ml if two_phase_active else solver_result.central_stock_mg_ml
+        fos_slow_stock = two_phase_result.slow_stock_mg_ml if two_phase_active else 0.0
+        fos_slow_rate = two_phase_result.slow_infusion_ml_min if two_phase_active else 0.0
+        fos_slow_duration = two_phase_result.slow_duration_min if two_phase_active else 0
+        setup_cols[3].metric("Solved central stock", f"{fos_central_stock:.6f} mg/mL")
 
         if scenario == "q24_replacement":
-            fos_extra_stock = solver_result.extra_replacement_concentration_mg_ml
             preload_extra_mg = 0.0
             extra_transfer_volume_ml = q_extra_to_central * reservoir_replacement_interval_h * 60
-            solver_cols = st.columns(4)
-            solver_cols[0].metric("Solved extra replacement", f"{fos_extra_stock:.6f} mg/mL")
-            solver_cols[1].metric("Predicted Cavg", f"{solver_result.predicted_cavg_mg_l:.1f} mg/L")
-            solver_cols[2].metric("Predicted Cmax", f"{solver_result.predicted_cmax_mg_l:.1f} mg/L", f"{solver_result.cmax_error_mg_l:+.1f}")
-            solver_cols[3].metric("Predicted Cmin after 24h", f"{solver_result.predicted_cmin_mg_l:.1f} mg/L")
-            if solver_result.feasible:
-                st.success(solver_result.message)
+            if two_phase_active:
+                fos_extra_stock = two_phase_result.extra_replacement_concentration_mg_ml
+                _render_two_phase_solver_panel(st, two_phase_result)
             else:
-                st.warning(solver_result.message)
+                if two_phase_result is not None:
+                    st.warning(two_phase_result.message + " Showing the single-infusion AUC + Cmax solver instead.")
+                fos_extra_stock = solver_result.extra_replacement_concentration_mg_ml
+                solver_cols = st.columns(4)
+                solver_cols[0].metric("Solved extra replacement", f"{fos_extra_stock:.6f} mg/mL")
+                solver_cols[1].metric("Predicted Cavg", f"{solver_result.predicted_cavg_mg_l:.1f} mg/L")
+                solver_cols[2].metric("Predicted Cmax", f"{solver_result.predicted_cmax_mg_l:.1f} mg/L", f"{solver_result.cmax_error_mg_l:+.1f}")
+                solver_cols[3].metric("Predicted Cmin after 24h", f"{solver_result.predicted_cmin_mg_l:.1f} mg/L")
+                if solver_result.feasible:
+                    st.success(solver_result.message)
+                else:
+                    st.warning(solver_result.message)
             if extra_transfer_volume_ml > extra_volume_ml:
                 max_flow_from_single_fill = extra_volume_ml / (reservoir_replacement_interval_h * 60)
                 st.error(
@@ -335,10 +399,18 @@ def _page_two_half_life() -> None:
             preload_default = fos_extra_stock * fos_extra_volume
             preload_extra_mg = manual_cols[2].number_input("Extra preload amount (mg)", min_value=0.0, value=preload_default, step=1.0)
         if scenario == "q24_replacement":
+            slow_line_caption = (
+                f"Slow line (pump 2, own syringe at {fos_slow_stock:.6f} mg/mL): {fos_slow_rate * 60:.3f} mL/h "
+                f"for {fos_slow_duration / 60:g} h right after each main infusion "
+                f"= {fos_slow_stock * fos_slow_rate * fos_slow_duration:.3f} mg in {fos_slow_rate * fos_slow_duration:.3f} mL. "
+                if two_phase_active and fos_slow_duration > 0
+                else ""
+            )
             st.caption(
                 f"Calculated central pump rate: {fos_central_rate:.3f} mL/min. "
                 f"Each central dose = {fos_central_stock * fos_central_volume:.3f} mg. "
-                f"Prepare {extra_volume_ml:.1f} mL of extra replacement solution at {fos_extra_stock:.6f} mg/mL "
+                + slow_line_caption
+                + f"Prepare {extra_volume_ml:.1f} mL of extra replacement solution at {fos_extra_stock:.6f} mg/mL "
                 f"per q{reservoir_replacement_interval_h:g}h interval before overfill."
             )
         else:
@@ -354,6 +426,10 @@ def _page_two_half_life() -> None:
         target_css_mg_l = 150.0
         target_cmax_mg_l = 250.0
         solver_result = None
+        two_phase_result = None
+        two_phase_active = False
+        fos_slow_stock = fos_slow_rate = 0.0
+        fos_slow_duration = 0
 
     system = SystemConfig(
         central_bottle_ml=central_bottle_ml,
@@ -373,6 +449,9 @@ def _page_two_half_life() -> None:
         dosing_interval_min=fos_interval,
         preload_extra_mg=preload_extra_mg,
         reservoir_replacement_interval_h=reservoir_replacement_interval_h,
+        slow_stock_mg_ml=fos_slow_stock,
+        slow_infusion_ml_min=fos_slow_rate,
+        slow_duration_min=fos_slow_duration,
     )
 
     st.subheader("4. Editable setup and injection overview")
@@ -436,7 +515,12 @@ def _page_two_half_life() -> None:
     cols = st.columns(5)
     cols[0].metric(f"{setup_drug_name} AUC0-24", f"{setup_summary['central_auc_0_24_mg_h_l']:.1f}", f"target {setup_target_auc:g}" if setup_target_auc else None)
     cols[1].metric("Central Cavg/Css", f"{setup_summary['central_cavg_0_24_mg_l']:.1f} mg/L", f"target {target_css_mg_l:g}")
-    cols[2].metric(f"{setup_drug_name} Cmax central", f"{setup_summary['central_cmax_mg_l']:.1f} mg/L", f"target {target_cmax_mg_l:g}")
+    cols[2].metric(
+        f"{setup_drug_name} Cmax central",
+        f"{setup_summary['central_cmax_mg_l']:.1f} mg/L",
+        # Two-phase mode has no Cmax target: the peak follows from the half-life and dose timing.
+        f"true curve {two_phase_result.reference_cmax_mg_l:.1f}" if two_phase_active else f"target {target_cmax_mg_l:g}",
+    )
     cmin_value = setup_summary["central_cmin_after_24h_mg_l"]
     cols[3].metric(f"{setup_drug_name} Cmin after 24h", f"{cmin_value:.1f} mg/L")
     if scenario == "q24_replacement":
@@ -444,10 +528,57 @@ def _page_two_half_life() -> None:
     else:
         cols[4].metric(f"{setup_drug_name} overflow loss", f"{setup_summary['overflow_loss_mg']:.2f} mg")
 
+    if two_phase_active:
+        steady_cols = st.columns(4)
+        steady_cols[0].metric(
+            "Steady-state AUC per 24 h",
+            f"{setup_summary['central_auc_last_24h_mg_h_l']:.1f}",
+            f"target {setup_target_auc:g}" if setup_target_auc else None,
+        )
+        steady_cols[1].metric(
+            "Steady-state Cmax",
+            f"{setup_summary['central_cmax_last_24h_mg_l']:.1f} mg/L",
+            f"true curve {two_phase_result.reference_cmax_mg_l:.1f}",
+            delta_color="off",
+        )
+        steady_cols[2].metric(
+            "Steady-state Cmin",
+            f"{setup_summary['central_cmin_last_24h_mg_l']:.1f} mg/L",
+            f"true curve {two_phase_result.reference_cmin_mg_l:.1f}",
+            delta_color="off",
+        )
+        steady_cols[3].metric("Max deviation from true curve", f"{two_phase_result.max_deviation_pct:.1f}%")
+        st.caption(
+            "Two-phase mode targets the settled daily exposure, taken here from the last 24 h of the run. "
+            "AUC0-24 in the row above covers the first day, while the system is still filling up, so it sits below the target."
+            + ("" if duration_h >= 48 else " Run at least 48 h to see the settled values.")
+        )
+
     rows = result.rows
     st.subheader("6. PK concentration")
     if setup_drug_values:
-        st.pyplot(_plot_static(rows, [setup_drug_name], f"{setup_drug_name} central and extra concentration", include_extra=True))
+        reference_curve = None
+        if two_phase_active:
+            reference_curve = _true_one_compartment_curve(
+                target_css_mg_l,
+                two_phase_result.reference_half_life_h,
+                fos_interval,
+                fos_duration,
+                duration_h,
+                dt_min,
+            )
+        st.pyplot(_plot_static(
+            rows,
+            [setup_drug_name],
+            f"{setup_drug_name} central and extra concentration",
+            include_extra=True,
+            reference=reference_curve,
+        ))
+        if two_phase_active:
+            st.caption(
+                f"Dotted line: the true one-compartment curve for a {two_phase_result.reference_half_life_h:g} h half-life "
+                "with the same dose timing and the same steady-state AUC. The extra line is the fixed fill concentration."
+            )
     central_drugs = [drug.name for drug in drugs]
     if central_drugs:
         st.pyplot(_plot_static(rows, central_drugs, "Central concentration for loading/infusion drugs", include_extra=False))
@@ -817,6 +948,81 @@ def _flow_widget_key(prefix: str, scenario: str, auto_flow_mode: bool, volume_or
     return f"{prefix}_{scenario}_auto_{volume_or_space:.3f}_{target_half_life_h:.3f}"
 
 
+_SLOW_LINE_SAME_STOCK = "Own syringe at the same concentration as the main infusion (lower pump rate)"
+_SLOW_LINE_SEPARATE_STOCK = "Own syringe at a weaker concentration, at a pump rate I set"
+
+
+def _render_two_phase_solver_panel(st, solution) -> None:
+    top = st.columns(4)
+    top[0].metric("Solved extra replacement", f"{solution.extra_replacement_concentration_mg_ml:.6f} mg/mL")
+    if solution.slow_duration_min > 0:
+        top[1].metric(
+            "Slow line",
+            f"{solution.slow_infusion_ml_min * 60:.3f} mL/h",
+            f"for {solution.slow_duration_min / 60:g} h after each infusion",
+            delta_color="off",
+        )
+        top[2].metric("Slow line syringe", f"{solution.slow_stock_mg_ml:.6f} mg/mL")
+    else:
+        top[1].metric("Slow line", "not needed")
+        top[2].metric("Slow line syringe", "-")
+    top[3].metric(
+        "Max deviation from true curve",
+        f"{solution.max_deviation_pct:.1f}%",
+        f"limit {solution.deviation_limit_pct:g}%",
+        delta_color="off",
+    )
+    bottom = st.columns(4)
+    bottom[0].metric("Steady-state Cavg", f"{solution.predicted_cavg_mg_l:.1f} mg/L")
+    bottom[1].metric(
+        "Steady-state Cmax",
+        f"{solution.predicted_cmax_mg_l:.1f} mg/L",
+        f"true curve {solution.reference_cmax_mg_l:.1f}",
+        delta_color="off",
+    )
+    bottom[2].metric(
+        "Steady-state Cmin",
+        f"{solution.predicted_cmin_mg_l:.1f} mg/L",
+        f"true curve {solution.reference_cmin_mg_l:.1f}",
+        delta_color="off",
+    )
+    bottom[3].metric("Half-life being followed", f"{solution.reference_half_life_h:g} h")
+    if solution.feasible:
+        st.success(solution.message)
+    else:
+        st.warning(solution.message)
+    st.caption(
+        "Max deviation is the largest gap, anywhere in one dosing interval at steady state, between this setup's "
+        "central concentration and the true one-compartment curve at the drug's own half-life. "
+        f"Without the slow line the same setup would be {solution.single_phase_max_deviation_pct:.1f}% off. "
+        "T>MIC can still differ by more than this figure when the MIC sits on a flat part of the curve."
+    )
+
+
+def _true_one_compartment_curve(
+    cavg_mg_l: float,
+    half_life_h: float,
+    interval_min: float,
+    infusion_min: float,
+    duration_h: float,
+    dt_min: float,
+) -> tuple[list[float], list[float], str]:
+    """Concentration from t=0 of a true one-compartment drug on the same dose timing (for the overlay)."""
+    k = math.log(2) / (half_life_h * 60)
+    duration = min(infusion_min, interval_min)
+    plateau = cavg_mg_l * interval_min / duration
+    decay = math.exp(-k * dt_min)
+    times, values = [], []
+    concentration = 0.0
+    for step in range(int(round(duration_h * 60 / dt_min)) + 1):
+        time_min = step * dt_min
+        times.append(time_min / 60)
+        values.append(concentration)
+        infusing = time_min % interval_min < duration
+        concentration = concentration * decay + (plateau * (1 - decay) if infusing else 0.0)
+    return times, values, f"true {half_life_h:g} h one-compartment curve"
+
+
 def _extra_setup_help_text(scenario: str) -> str:
     if scenario == "q24_replacement":
         return (
@@ -1003,6 +1209,18 @@ def _injection_plan_rows(drug_inputs: dict[str, dict], fos: FosfomycinConfig, sc
                     f"{fos.infusion_duration_min / 60:g} h, q{fos.dosing_interval_min / 60:g}h"
                 ),
             })
+            if fos.has_slow_line:
+                slow_start_h = fos.infusion_duration_min / 60
+                rows.append({
+                    "Drug": name,
+                    "Target": "curve shape (two-phase)",
+                    "Half-life": f"{values['half_life_h']:g} h",
+                    "Dosing plan": "central slow line (pump 2, own syringe)",
+                    "Physical setting": (
+                        f"{fos.slow_dose_volume_ml:.3f} mL at {fos.slow_infusion_ml_min * 60:.3f} mL/h, "
+                        f"h {slow_start_h:g}-{slow_start_h + fos.slow_duration_min / 60:g} of each q{fos.dosing_interval_min / 60:g}h"
+                    ),
+                })
             if scenario != "q24_replacement":
                 rows.append({
                     "Drug": name,
@@ -1238,7 +1456,14 @@ def _apparatus_cartridge(ax, x, y, w=3.0, h=0.52, label=None, volume=None, label
         ax.text(x, text_y, volume, ha="center", va="bottom", fontsize=8.8, color=c["volume"], zorder=8)
 
 
-def _apparatus_injection_band(ax, groups, x_start, y_top, width, columns=3, max_lines=8, header=None):
+_INJECTION_BAND_LINE_HEIGHT = 0.21
+
+
+def _injection_band_row_height(max_lines: int) -> float:
+    return 0.26 + max_lines * _INJECTION_BAND_LINE_HEIGHT + 0.22
+
+
+def _apparatus_injection_band(ax, groups, x_start, y_top, width, columns=3, max_lines=8, header=None, max_rows=1):
     """Lay dosing instructions out as a row of per-drug blocks under the apparatus.
 
     Keeping them in their own band means the block list grows sideways with drug count instead of
@@ -1249,13 +1474,18 @@ def _apparatus_injection_band(ax, groups, x_start, y_top, width, columns=3, max_
     if header:
         ax.text(x_start, y_top, header, ha="left", va="top", fontsize=9.4, weight="bold", color=_APPARATUS["inject"])
         block_y = y_top - 0.32
-    for index, (title, lines) in enumerate(groups[: columns]):
-        _apparatus_injection_block(ax, x_start + index * width, block_y, title, lines, max_lines=max_lines)
-    if len(groups) > columns:
+    capacity = columns * max_rows
+    row_height = _injection_band_row_height(max_lines)
+    for index, (title, lines) in enumerate(groups[:capacity]):
+        row, column = divmod(index, columns)
+        _apparatus_injection_block(
+            ax, x_start + column * width, block_y - row * row_height, title, lines, max_lines=max_lines
+        )
+    if len(groups) > capacity:
         ax.text(
             x_start,
-            block_y - 0.26 - max_lines * 0.21,
-            f"+{len(groups) - columns} more drugs (see Section 7)",
+            block_y - (max_rows - 1) * row_height - 0.26 - max_lines * 0.21,
+            f"+{len(groups) - capacity} more drugs (see Section 7)",
             ha="left",
             va="top",
             fontsize=7.6,
@@ -1554,7 +1784,11 @@ def _plot_one_half_life_apparatus(view: dict):
 def _plot_two_half_life_apparatus(view: dict):
     """Central + extra apparatus, including the extra compartment and its diluent reservoir."""
     c = _APPARATUS
-    fig, ax = _new_apparatus_figure(13.8, 9.8, (0, 13.8), (0, 9.8))
+    # Central dosing blocks sit two per row. More than two blocks (for example a two-pump setup drug
+    # plus other drugs) get a second row, and the canvas grows downward to hold it.
+    central_band_rows = 2 if len(view["central_injection_groups"]) > 2 else 1
+    band_extra_height = (central_band_rows - 1) * _injection_band_row_height(6)
+    fig, ax = _new_apparatus_figure(13.8, 9.8 + band_extra_height, (0, 13.8), (-band_extra_height, 9.8))
 
     central_x, bottle_y = 5.05, 5.90
     waste_x, extra_x, diluent_extra_x = 1.60, 8.50, 11.90
@@ -1595,7 +1829,7 @@ def _plot_two_half_life_apparatus(view: dict):
     _apparatus_syringe(ax, (central_port[0] - 0.21, central_port[1]), angle_deg=0.0, scale=1.18)
     _apparatus_injection_band(
         ax, view["central_injection_groups"], 0.55, 1.75, width=2.55, columns=2, max_lines=6,
-        header="Injected into central",
+        header="Injected into central", max_rows=central_band_rows,
     )
 
     extra_port = (extra_x + 0.59, bottle_y + 0.30)
@@ -1680,7 +1914,34 @@ def _two_half_life_apparatus_view(
         f"at {fos.central_infusion_ml_min:.3f} mL/min over {fos.infusion_duration_min / 60:g} h",
         f"{fos.central_dose_mg * 24 / interval_h:.2f} mg/day",
     ]
-    central_groups = [(f"{fos.drug_name} q{interval_h:g}h", setup_lines)]
+    if fos.has_slow_line:
+        # Two syringe pumps feed central in turn, so each gets its own block with the same three
+        # facts in the same order: when it runs, how fast, how much. Each pump has its own syringe.
+        main_end_h = fos.infusion_duration_min / 60
+        slow_end_h = main_end_h + fos.slow_duration_min / 60
+        central_groups = [
+            (
+                f"{fos.drug_name} pump 1 (main)",
+                [
+                    f"hour 0-{main_end_h:g} of every q{interval_h:g}h dose",
+                    f"{fos.central_infusion_ml_min * 60:.2f} mL/h",
+                    f"{fos.central_dose_mg:.2f} mg in {dose_volume_ml:g} mL",
+                    f"syringe {fos.central_stock_mg_ml:.2f} mg/mL",
+                ],
+            ),
+            (
+                f"{fos.drug_name} pump 2 (slow)",
+                [
+                    f"hour {main_end_h:g}-{slow_end_h:g}, right after pump 1",
+                    f"{fos.slow_infusion_ml_min * 60:.3f} mL/h",
+                    f"{fos.slow_dose_mg:.2f} mg in {fos.slow_dose_volume_ml:.2f} mL",
+                    f"own syringe {fos.slow_stock_mg_ml:.2f} mg/mL",
+                    f"both pumps: {(fos.central_dose_mg + fos.slow_dose_mg) * 24 / interval_h:.2f} mg/day",
+                ],
+            ),
+        ]
+    else:
+        central_groups = [(f"{fos.drug_name} q{interval_h:g}h", setup_lines)]
     central_groups.extend(_central_drug_apparatus_groups(drug_inputs, summary, skip=fos.drug_name))
 
     if scenario == "q24_replacement":
@@ -1798,10 +2059,13 @@ def _figure_export_bytes(fig, file_format: str, dpi: int = 300) -> bytes:
     return buffer.getvalue()
 
 
-def _plot_static(rows: list[dict], drugs: list[str], title: str, include_extra: bool):
+def _plot_static(rows: list[dict], drugs: list[str], title: str, include_extra: bool, reference=None):
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(9, 4.2))
+    if reference is not None:
+        reference_times, reference_values, reference_label = reference
+        ax.plot(reference_times, reference_values, label=reference_label, linewidth=1.4, linestyle=":", color="#444444", zorder=5)
     for drug in drugs:
         drug_rows = [row for row in rows if row["drug"] == drug]
         ax.plot(
@@ -2290,6 +2554,22 @@ def _interpretation_text(scenario: str, setup_drug_name: str, setup_summary: dic
     return "\n".join(lines)
 
 
+def _slow_line_equation_lines(fos: FosfomycinConfig) -> list[str]:
+    if not fos.has_slow_line:
+        return []
+    interval_h = fos.dosing_interval_min / 60
+    start_h = fos.infusion_duration_min / 60
+    return [
+        "   Two-phase setup: a second central line runs right after the main infusion.",
+        f"   Slow line window = h {start_h:g} to {start_h + fos.slow_duration_min / 60:g} of every q{interval_h:g}h interval",
+        f"   Slow line volume = rate x duration = {fos.slow_infusion_ml_min:.6g} x {fos.slow_duration_min:g} = {fos.slow_dose_volume_ml:.3f} mL",
+        f"   Slow line amount = stock x volume = {fos.slow_stock_mg_ml:.6g} x {fos.slow_dose_volume_ml:.3f} = {fos.slow_dose_mg:.3f} mg",
+        f"   Daily slow line amount = {fos.slow_dose_mg:.3f} x 24 / {interval_h:g} = {fos.slow_dose_mg * 24 / interval_h:.3f} mg/day",
+        "   Main rate, slow rate and extra concentration are the least-squares mix that best follows the true",
+        "   one-compartment steady-state curve, then scaled so steady-state Cavg equals the target exactly.",
+    ]
+
+
 def _equation_text(
     system: SystemConfig,
     fos: FosfomycinConfig,
@@ -2354,6 +2634,7 @@ def _equation_text(
         f"   Dose volume = central infusion rate x infusion duration = {fos.central_infusion_ml_min:.6g} x {fos.infusion_duration_min:g} = {central_dose_volume:.3f} mL",
         f"   Dose amount = central stock x dose volume = {fos.central_stock_mg_ml:.6g} x {central_dose_volume:.3f} = {central_dose_mg:.3f} mg",
         f"   Daily central amount = dose amount x 24 / interval = {central_dose_mg:.3f} x 24 / {dose_interval_h:g} = {daily_central_mg:.3f} mg/day",
+        *_slow_line_equation_lines(fos),
         "",
         "4. AUC calculation",
         "   AUC0-24 = trapezoidal sum of central concentration over 0 to 24 h",

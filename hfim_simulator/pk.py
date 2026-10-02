@@ -33,10 +33,28 @@ class FosfomycinConfig:
     preload_extra_mg: float | None = None
     drug_name: str = "fosfomycin"
     reservoir_replacement_interval_h: float = 24.0
+    # Optional second central line ("slow line") used by the two-phase curve-shape setup. It starts
+    # the moment the main infusion ends and runs for slow_duration_min in every dosing interval.
+    # All three default to 0, which means "no slow line" and leaves the classic setup unchanged.
+    slow_stock_mg_ml: float = 0.0
+    slow_infusion_ml_min: float = 0.0
+    slow_duration_min: int = 0
 
     @property
     def central_dose_mg(self) -> float:
         return self.central_stock_mg_ml * self.central_infusion_ml_min * self.infusion_duration_min
+
+    @property
+    def has_slow_line(self) -> bool:
+        return self.slow_duration_min > 0 and self.slow_infusion_ml_min > 0 and self.slow_stock_mg_ml > 0
+
+    @property
+    def slow_dose_volume_ml(self) -> float:
+        return self.slow_infusion_ml_min * self.slow_duration_min if self.has_slow_line else 0.0
+
+    @property
+    def slow_dose_mg(self) -> float:
+        return self.slow_stock_mg_ml * self.slow_dose_volume_ml
 
     @property
     def extra_dose_mg(self) -> float:
@@ -99,6 +117,37 @@ class CssCmaxSolverResult:
     cmax_error_mg_l: float
     feasible: bool
     message: str
+
+
+@dataclass(frozen=True)
+class TwoPhaseSolverResult:
+    """Steady-state solution of the two-phase (main infusion + slow line + fixed extra feed) setup.
+
+    All predicted_* values describe one dosing interval at steady state, not the first 24 h.
+    max_deviation_pct is the largest relative gap between the achievable central profile and the
+    true one-compartment profile at the drug's own (long) half-life, anywhere in the interval.
+    """
+
+    central_stock_mg_ml: float
+    slow_stock_mg_ml: float
+    slow_infusion_ml_min: float
+    slow_duration_min: int
+    extra_replacement_concentration_mg_ml: float
+    target_css_mg_l: float
+    reference_half_life_h: float
+    predicted_cavg_mg_l: float
+    predicted_cmax_mg_l: float
+    predicted_cmin_mg_l: float
+    reference_cmax_mg_l: float
+    reference_cmin_mg_l: float
+    max_deviation_pct: float
+    single_phase_max_deviation_pct: float
+    deviation_limit_pct: float
+    feasible: bool
+    message: str
+    cycle_time_h: tuple
+    predicted_profile_mg_l: tuple
+    reference_profile_mg_l: tuple
 
 
 def compute_continuous_infusion(
@@ -221,6 +270,11 @@ def simulate_hfim(
             fos.infusion_duration_min,
             fos.dosing_interval_min,
         )
+        + (
+            average_intermittent_rate(fos.slow_infusion_ml_min, fos.slow_duration_min, fos.dosing_interval_min)
+            if fos.has_slow_line
+            else 0.0
+        )
         if fos is not None
         else 0.0
     )
@@ -282,6 +336,8 @@ def simulate_hfim(
             if fos is not None
             else 0.0
         )
+        # Second central line (two-phase setup): runs right after the main infusion ends.
+        q_fos_slow = _slow_line_rate(time_min, fos) if fos is not None else 0.0
         q_fos_extra = 0.0
         if fos is not None and scenario == "overflow":
             q_fos_extra = _q6h_rate(time_min, fos.extra_infusion_ml_min, fos.infusion_duration_min, fos.dosing_interval_min)
@@ -291,8 +347,13 @@ def simulate_hfim(
         c_extra_mg_ml = a_extra / ve
         setup_central_stock_mg_ml = fos.central_stock_mg_ml if fos is not None else 0.0
         setup_extra_stock_mg_ml = fos.extra_stock_mg_ml if fos is not None else 0.0
-        central_input_mg_min = q_fos_central * setup_central_stock_mg_ml + system.q_extra_to_central_ml_min * c_extra_mg_ml
-        central_output_mg_min = (system.q_waste_ml_min + q_fos_central) * c_central_mg_ml
+        setup_slow_stock_mg_ml = fos.slow_stock_mg_ml if fos is not None else 0.0
+        central_input_mg_min = (
+            q_fos_central * setup_central_stock_mg_ml
+            + q_fos_slow * setup_slow_stock_mg_ml
+            + system.q_extra_to_central_ml_min * c_extra_mg_ml
+        )
+        central_output_mg_min = (system.q_waste_ml_min + q_fos_central + q_fos_slow) * c_central_mg_ml
         extra_input_mg_min = q_fos_extra * setup_extra_stock_mg_ml
         extra_to_central_mg_min = system.q_extra_to_central_ml_min * c_extra_mg_ml
         extra_overflow_mg_min = q_fos_extra * c_extra_mg_ml if scenario == "overflow" else 0.0
@@ -313,7 +374,7 @@ def simulate_hfim(
             # Every drug shares the same fixed central volume, so it washes out against the same total
             # instantaneous outflow, including the setup drug's own central pump flow (q_fos_central),
             # not just the shared diluent/extra-transfer flow.
-            output_mg_min = (system.q_waste_ml_min + q_fos_central) * concentration_mg_ml
+            output_mg_min = (system.q_waste_ml_min + q_fos_central + q_fos_slow) * concentration_mg_ml
             drug_amounts[name] = max(0.0, amount + (input_mg_min - output_mg_min) * dt_min)
 
     summary = {
@@ -524,8 +585,293 @@ def solve_css_cmax_replacement(
     )
 
 
+def one_compartment_steady_state_profile(
+    cavg_mg_l: float,
+    half_life_h: float,
+    interval_min: float,
+    infusion_min: float,
+    dt_min: float = 1,
+) -> list[float]:
+    """True steady-state profile of a one-compartment drug given as repeated IV infusion.
+
+    This is the curve the HFIM setup is trying to reproduce for the long-half-life drug: the dose
+    per interval is whatever delivers cavg_mg_l (dose / interval = CL x Cavg), infused over
+    infusion_min and eliminated at half_life_h. One value per dt_min step across one interval.
+    """
+    if cavg_mg_l <= 0 or half_life_h <= 0 or interval_min <= 0 or infusion_min <= 0 or dt_min <= 0:
+        return []
+    duration = min(infusion_min, interval_min)
+    k = math.log(2) / (half_life_h * 60)
+    plateau = cavg_mg_l * interval_min / duration
+    cmax = plateau * (1 - math.exp(-k * duration)) / (1 - math.exp(-k * interval_min))
+    cmin = cmax * math.exp(-k * (interval_min - duration))
+    steps = int(round(interval_min / dt_min))
+    profile = []
+    for step in range(steps):
+        t = step * dt_min
+        if t < duration:
+            profile.append(plateau * (1 - math.exp(-k * t)) + cmin * math.exp(-k * t))
+        else:
+            profile.append(cmax * math.exp(-k * (t - duration)))
+    return profile
+
+
+def _periodic_central_profile(
+    input_mg_min: list[float],
+    pump_flow_ml_min: list[float],
+    waste_flow_ml_min: float,
+    central_volume_ml: float,
+    dt_min: float,
+) -> list[float]:
+    """Steady-state central concentration (mg/L) over one dosing interval for a repeating input.
+
+    Uses the same explicit time step as simulate_hfim, so the solved setup reproduces exactly what
+    the full simulation shows once it has settled. Each step is A_next = A x gain + input x dt, so a
+    whole interval is an affine map A_end = a x A_start + b; the repeating state is A_start = b / (1 - a).
+    """
+    gains = [1 - (waste_flow_ml_min + flow) / central_volume_ml * dt_min for flow in pump_flow_ml_min]
+    a = 1.0
+    b = 0.0
+    for gain, rate in zip(gains, input_mg_min):
+        b = b * gain + rate * dt_min
+        a *= gain
+    if not 0 <= a < 1:
+        raise ValueError("time step is too large for the central washout rate")
+    amount = b / (1 - a)
+    profile = []
+    for gain, rate in zip(gains, input_mg_min):
+        profile.append(amount / central_volume_ml * 1000)
+        amount = amount * gain + rate * dt_min
+    return profile
+
+
+def _weighted_nonnegative_fit(columns: list[list[float]], target: list[float]) -> list[float] | None:
+    """Least-squares mix of basis profiles that best follows target in relative terms, all weights >= 0.
+
+    There are at most three basis profiles (main infusion, slow line, extra feed), so every subset is
+    simply tried: solve the small normal equations for that subset and keep the best all-non-negative one.
+    """
+    count = len(columns)
+    weights = [1 / (value * value) for value in target]
+    best = None
+    for mask in range(1, 2 ** count):
+        active = [index for index in range(count) if mask & (1 << index)]
+        matrix = [
+            [sum(w * columns[i][n] * columns[j][n] for n, w in enumerate(weights)) for j in active]
+            for i in active
+        ]
+        rhs = [sum(w * columns[i][n] * target[n] for n, w in enumerate(weights)) for i in active]
+        solution = _solve_linear(matrix, rhs)
+        if solution is None or any(value < 0 for value in solution):
+            continue
+        coefficients = [0.0] * count
+        for index, value in zip(active, solution):
+            coefficients[index] = value
+        residual = sum(
+            w * (sum(coefficients[i] * columns[i][n] for i in active) - target[n]) ** 2
+            for n, w in enumerate(weights)
+        )
+        if best is None or residual < best[0]:
+            best = (residual, coefficients)
+    return best[1] if best else None
+
+
+def _solve_linear(matrix: list[list[float]], rhs: list[float]) -> list[float] | None:
+    size = len(rhs)
+    rows = [list(row) + [value] for row, value in zip(matrix, rhs)]
+    for col in range(size):
+        pivot = max(range(col, size), key=lambda r: abs(rows[r][col]))
+        if abs(rows[pivot][col]) < 1e-300:
+            return None
+        rows[col], rows[pivot] = rows[pivot], rows[col]
+        for r in range(size):
+            if r != col:
+                factor = rows[r][col] / rows[col][col]
+                rows[r] = [x - factor * y for x, y in zip(rows[r], rows[col])]
+    return [rows[i][size] / rows[i][i] for i in range(size)]
+
+
+def solve_two_phase_replacement(
+    system: SystemConfig,
+    drug_name: str,
+    target_css_mg_l: float,
+    reference_half_life_h: float,
+    central_infusion_ml_min: float,
+    infusion_duration_min: int,
+    dosing_interval_min: int,
+    slow_infusion_ml_min: float | None = None,
+    dt_min: float = 1,
+    slow_duration_step_min: int = 30,
+    deviation_limit_pct: float = 10.0,
+) -> TwoPhaseSolverResult:
+    """Solve the q24h-replacement setup so the central curve follows the drug's own half-life.
+
+    Central washout is fixed by the shortest half-life on the system, so a longer-half-life drug
+    falls too fast once its infusion stops. Three drug sources are combined to slow that fall:
+
+    - the main central infusion (dose volume and duration as entered),
+    - a slow second central line that starts when the main infusion ends, and
+    - the fixed-concentration extra compartment feeding central at Qextra the whole time.
+
+    The solver picks the three strengths and the slow-line duration that track the true
+    one-compartment steady-state curve most closely, then scales them so steady-state Cavg (and so
+    AUC per day) equals the target exactly. It reports how far the result still is from the true
+    curve; beyond deviation_limit_pct the setup should not be relied on for curve shape.
+
+    The slow line always runs from its own syringe on a second pump. slow_infusion_ml_min=None means
+    that syringe holds solution at the same concentration as the main infusion and the pump rate is
+    solved; a number means the pump runs at that fixed rate and a weaker concentration is solved.
+    """
+    steps = int(round(dosing_interval_min / dt_min)) if dt_min > 0 else 0
+    reference = one_compartment_steady_state_profile(
+        target_css_mg_l, reference_half_life_h, dosing_interval_min, infusion_duration_min, dt_min
+    )
+    if (
+        steps <= 0
+        or not reference
+        or central_infusion_ml_min <= 0
+        or infusion_duration_min <= 0
+        or infusion_duration_min > dosing_interval_min
+    ):
+        return TwoPhaseSolverResult(
+            0.0, 0.0, 0.0, 0, 0.0, target_css_mg_l, reference_half_life_h, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, deviation_limit_pct, False,
+            "Target, half-life, dose volume, infusion duration and dosing interval must all be positive, "
+            "and the infusion cannot be longer than the dosing interval.",
+            (), (), (),
+        )
+
+    vc = system.central_volume_ml
+    waste = system.q_waste_ml_min
+    q_extra = system.q_extra_to_central_ml_min
+    times = [step * dt_min for step in range(steps)]
+    in_main = [t < infusion_duration_min for t in times]
+    main_input = [1.0 if flag else 0.0 for flag in in_main]
+    floor_input = [1.0] * steps
+
+    def evaluate(slow_duration_min: int):
+        slow_end = infusion_duration_min + slow_duration_min
+        in_slow = [infusion_duration_min <= t < slow_end for t in times]
+        slow_input = [1.0 if flag else 0.0 for flag in in_slow]
+        slow_flow = slow_infusion_ml_min if slow_infusion_ml_min is not None else 0.0
+        outcome = None
+        # With a shared stock the slow line's own (small) pump flow depends on the answer, so the
+        # fit is repeated a few times with the flow it implies; it settles after one or two passes.
+        for _ in range(4 if slow_infusion_ml_min is None and slow_duration_min > 0 else 1):
+            pump_flow = [
+                (central_infusion_ml_min if main else 0.0) + (slow_flow if slow else 0.0)
+                for main, slow in zip(in_main, in_slow)
+            ]
+            columns = [_periodic_central_profile(main_input, pump_flow, waste, vc, dt_min)]
+            labels = ["main"]
+            if slow_duration_min > 0:
+                columns.append(_periodic_central_profile(slow_input, pump_flow, waste, vc, dt_min))
+                labels.append("slow")
+            if q_extra > 0:
+                columns.append(_periodic_central_profile(floor_input, pump_flow, waste, vc, dt_min))
+                labels.append("floor")
+            fitted = _weighted_nonnegative_fit(columns, reference)
+            if fitted is None:
+                return None
+            profile = [sum(c * column[n] for c, column in zip(fitted, columns)) for n in range(steps)]
+            cavg = sum(profile) / steps
+            if cavg <= 0:
+                return None
+            scale = target_css_mg_l / cavg
+            rates = {label: value * scale for label, value in zip(labels, fitted)}
+            profile = [value * scale for value in profile]
+            main_rate = rates.get("main", 0.0)
+            slow_rate = rates.get("slow", 0.0)
+            outcome = (profile, main_rate, slow_rate, rates.get("floor", 0.0), slow_flow)
+            if slow_infusion_ml_min is not None or slow_duration_min == 0:
+                break
+            if main_rate <= 0:
+                return None
+            # Same concentration as the main infusion: concentration = main mg/min / main mL/min.
+            slow_flow = slow_rate / (main_rate / central_infusion_ml_min)
+        return outcome
+
+    def max_deviation(profile: list[float]) -> float:
+        return max(abs(value / ref - 1) for value, ref in zip(profile, reference)) * 100
+
+    candidates = [0]
+    longest = int(dosing_interval_min - infusion_duration_min)
+    step_size = max(1, int(slow_duration_step_min))
+    candidates.extend(range(step_size, longest + 1, step_size))
+    best = None
+    single_phase_deviation = 0.0
+    for slow_duration in candidates:
+        outcome = evaluate(slow_duration)
+        if outcome is None:
+            continue
+        deviation = max_deviation(outcome[0])
+        if slow_duration == 0:
+            single_phase_deviation = deviation
+        if outcome[2] <= 0 and slow_duration > 0:
+            continue
+        if best is None or deviation < best[0] - 1e-9:
+            best = (deviation, slow_duration, outcome)
+    if best is None:
+        return TwoPhaseSolverResult(
+            0.0, 0.0, 0.0, 0, 0.0, target_css_mg_l, reference_half_life_h, 0.0, 0.0, 0.0,
+            max(reference), min(reference), 0.0, 0.0, deviation_limit_pct, False,
+            "No non-negative combination of central infusion, slow line and extra feed could reach the target.",
+            (), (), (),
+        )
+
+    deviation, slow_duration, (profile, main_rate, slow_rate, floor_rate, slow_flow) = best
+    central_stock = main_rate / central_infusion_ml_min
+    if slow_duration > 0 and slow_rate > 0:
+        slow_stock = central_stock if slow_infusion_ml_min is None else slow_rate / slow_infusion_ml_min
+    else:
+        slow_duration, slow_flow, slow_stock = 0, 0.0, 0.0
+    extra_concentration = floor_rate / q_extra if q_extra > 0 else 0.0
+    feasible = deviation <= deviation_limit_pct
+    if feasible:
+        message = (
+            f"Two-phase setup follows the true {reference_half_life_h:g} h curve within "
+            f"{deviation:.1f}% at every point of the dosing interval."
+        )
+    else:
+        message = (
+            f"Two-phase setup stays up to {deviation:.1f}% away from the true {reference_half_life_h:g} h curve, "
+            f"above the {deviation_limit_pct:g}% limit. Daily AUC is still exact, but curve shape, trough and "
+            "T>MIC are not reliable for this combination; use a Blaser-type setup for it."
+        )
+    return TwoPhaseSolverResult(
+        central_stock_mg_ml=central_stock,
+        slow_stock_mg_ml=slow_stock,
+        slow_infusion_ml_min=slow_flow,
+        slow_duration_min=slow_duration,
+        extra_replacement_concentration_mg_ml=extra_concentration,
+        target_css_mg_l=target_css_mg_l,
+        reference_half_life_h=reference_half_life_h,
+        predicted_cavg_mg_l=sum(profile) / steps,
+        predicted_cmax_mg_l=max(profile),
+        predicted_cmin_mg_l=min(profile),
+        reference_cmax_mg_l=max(reference),
+        reference_cmin_mg_l=min(reference),
+        max_deviation_pct=deviation,
+        single_phase_max_deviation_pct=single_phase_deviation,
+        deviation_limit_pct=deviation_limit_pct,
+        feasible=feasible,
+        message=message,
+        cycle_time_h=tuple(t / 60 for t in times),
+        predicted_profile_mg_l=tuple(profile),
+        reference_profile_mg_l=tuple(reference),
+    )
+
+
 def _q6h_rate(time_min: float, rate_ml_min: float, duration_min: int, interval_min: int) -> float:
     return rate_ml_min if time_min % interval_min < duration_min else 0.0
+
+
+def _slow_line_rate(time_min: float, fos: FosfomycinConfig) -> float:
+    if not fos.has_slow_line:
+        return 0.0
+    position = time_min % fos.dosing_interval_min
+    start = fos.infusion_duration_min
+    return fos.slow_infusion_ml_min if start <= position < start + fos.slow_duration_min else 0.0
 
 
 def average_intermittent_rate(rate_ml_min: float, duration_min: int, interval_min: int) -> float:
@@ -618,6 +964,9 @@ def _summarize_intermit(rows: list[dict], drug_name: str, overflow_loss_mg: floa
     drug_rows = [row for row in rows if row["drug"] == drug_name]
     central = [row["central_mg_l"] for row in drug_rows]
     extra = [row["extra_mg_l"] for row in drug_rows]
+    last_end_h = drug_rows[-1]["time_h"]
+    last_start_h = max(0.0, last_end_h - 24)
+    last_rows = [row for row in drug_rows if row["time_h"] >= last_start_h - 1e-9]
     return {
         "central_cmax_mg_l": max(central),
         # Minimum over the whole series, dominated by the pre-dose baseline (0 at t=0) - not a
@@ -633,6 +982,11 @@ def _summarize_intermit(rows: list[dict], drug_name: str, overflow_loss_mg: floa
         # Same caveat as central_cmin_overall_mg_l - whole-series minimum, not a steady-state trough.
         "extra_cmin_overall_mg_l": min(extra),
         "central_auc_0_24_mg_h_l": _auc(drug_rows, "central_mg_l", 24),
+        # Last 24 h of the run: the settled daily exposure once the system has stopped filling up.
+        # Equals the 0-24 h figures when the run is only 24 h long.
+        "central_auc_last_24h_mg_h_l": _auc_window(drug_rows, "central_mg_l", last_start_h, last_end_h),
+        "central_cmax_last_24h_mg_l": max(row["central_mg_l"] for row in last_rows),
+        "central_cmin_last_24h_mg_l": min(row["central_mg_l"] for row in last_rows),
         "extra_auc_0_24_mg_h_l": _auc(drug_rows, "extra_mg_l", 24),
         "central_auc_full_mg_h_l": _auc(drug_rows, "central_mg_l", None),
         "extra_auc_full_mg_h_l": _auc(drug_rows, "extra_mg_l", None),
@@ -649,6 +1003,14 @@ def _auc(rows: list[dict], column: str, until_h: float | None) -> float:
     for prev, curr in zip(usable, usable[1:]):
         dt_h = curr["time_h"] - prev["time_h"]
         total += (prev[column] + curr[column]) * 0.5 * dt_h
+    return total
+
+
+def _auc_window(rows: list[dict], column: str, start_h: float, end_h: float) -> float:
+    total = 0.0
+    usable = [row for row in rows if start_h - 1e-9 <= row["time_h"] <= end_h + 1e-9]
+    for prev, curr in zip(usable, usable[1:]):
+        total += (prev[column] + curr[column]) * 0.5 * (curr["time_h"] - prev["time_h"])
     return total
 
 
@@ -674,6 +1036,20 @@ def _preparation_table(
             "note": f"{fos.central_infusion_ml_min * fos.infusion_duration_min:g} mL over {fos.infusion_duration_min / 60:g} h",
         }
     )
+    if fos.has_slow_line:
+        slow_start_h = fos.infusion_duration_min / 60
+        slow_end_h = slow_start_h + fos.slow_duration_min / 60
+        table.append({
+            "drug": fos.drug_name,
+            "component": f"central q{fos.dosing_interval_min / 60:g}h slow line (h {slow_start_h:g}-{slow_end_h:g})",
+            "amount_mg": fos.slow_dose_mg,
+            "daily_amount_mg": fos.slow_dose_mg * 24 / (fos.dosing_interval_min / 60),
+            "note": (
+                f"{fos.slow_dose_volume_ml:.3f} mL over {fos.slow_duration_min / 60:g} h "
+                f"at {fos.slow_stock_mg_ml:g} mg/mL and {fos.slow_infusion_ml_min * 60:.3f} mL/h; "
+                f"pump 2 with its own syringe, starts when the main infusion ends"
+            ),
+        })
     if scenario == "overflow":
         table.append({
             "drug": fos.drug_name,
