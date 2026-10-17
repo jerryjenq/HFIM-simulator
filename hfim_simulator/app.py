@@ -403,7 +403,7 @@ def _page_two_half_life() -> None:
         if scenario == "q24_replacement":
             slow_line_caption = (
                 f"Slow line (pump 2, own syringe at {fos_slow_stock:.6f} mg/mL): {fos_slow_rate * 60:.3f} mL/h "
-                f"for {fos_slow_duration / 60:g} h right after each main infusion "
+                f"for {fos_slow_duration / 60:g} h right after each main infusion, every q{fos_frequency_h:g}h "
                 f"= {fos_slow_stock * fos_slow_rate * fos_slow_duration:.3f} mg in {fos_slow_rate * fos_slow_duration:.3f} mL. "
                 if two_phase_active and fos_slow_duration > 0
                 else ""
@@ -2036,7 +2036,8 @@ def _two_half_life_apparatus_view(
             (
                 f"{fos.drug_name} pump 2 (slow)",
                 [
-                    f"hour {main_end_h:g}-{slow_end_h:g}, right after pump 1",
+                    f"hour {main_end_h:g}-{slow_end_h:g} of every q{interval_h:g}h dose",
+                    "starts when pump 1 stops",
                     f"{fos.slow_infusion_ml_min * 60:.3f} mL/h",
                     f"{fos.slow_dose_mg:.2f} mg in {fos.slow_dose_volume_ml:.2f} mL",
                     f"own syringe {fos.slow_stock_mg_ml:.2f} mg/mL",
