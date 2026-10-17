@@ -463,5 +463,43 @@ class HfimAppLogicTest(unittest.TestCase):
             plt.close(fig)
 
 
+class VolumeBalanceTest(unittest.TestCase):
+    def test_waste_pump_also_removes_both_setup_syringes(self):
+        from hfim_simulator.app import _setup_drug_dose_volume_flow_ml_min, _waste_pump_setting_ml_min
+        from hfim_simulator.pk import FosfomycinConfig, flow_for_half_life
+
+        fos = FosfomycinConfig(
+            central_stock_mg_ml=6.7, extra_stock_mg_ml=0.54, central_infusion_ml_min=0.1, extra_infusion_ml_min=0.0,
+            infusion_duration_min=60, dosing_interval_min=360, preload_extra_mg=0.0,
+            slow_stock_mg_ml=6.7, slow_infusion_ml_min=0.013507, slow_duration_min=150,
+        )
+        dose_flow = _setup_drug_dose_volume_flow_ml_min(fos)
+
+        self.assertAlmostEqual(dose_flow, (6 + 0.013507 * 150) / 360, places=9)
+        self.assertAlmostEqual(_waste_pump_setting_ml_min(flow_for_half_life(170, 1.25), dose_flow), 1.5934, places=4)
+
+    def test_intermittent_dose_volume_and_loading_volume_totals(self):
+        from hfim_simulator.app import _intermittent_dose_volume_flow_ml_min, _loading_volume_total_ml
+
+        drug_inputs = {
+            "imipenem": {"maintenance": "continuous infusion", "loading_dose": True, "loading_volume_ml": 5.0},
+            "relebactam": {"maintenance": "continuous infusion", "loading_dose": True, "loading_volume_ml": 5.0},
+            "meropenem": {"maintenance": "intermittent infusion", "loading_dose": False, "loading_volume_ml": 5.0,
+                          "dose_volume_ml": 8.0, "dosing_frequency_h": 8.0},
+        }
+
+        self.assertAlmostEqual(_intermittent_dose_volume_flow_ml_min(drug_inputs), 8 / 480, places=12)
+        self.assertEqual(_loading_volume_total_ml(drug_inputs), 10.0)
+        self.assertEqual(_loading_volume_total_ml(drug_inputs, skip="imipenem"), 5.0)
+
+    def test_note_tells_the_bench_setting_and_starting_fill(self):
+        from hfim_simulator.app import _volume_balance_note
+
+        note = _volume_balance_note(1.5711, 8.03 / 360, 10.0, 100.0)
+
+        self.assertIn("1.593 mL/min", note)
+        self.assertIn("**90 mL**", note)
+
+
 if __name__ == "__main__":
     unittest.main()

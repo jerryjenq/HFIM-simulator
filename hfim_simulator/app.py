@@ -475,8 +475,11 @@ def _page_two_half_life() -> None:
 
     # One integrated apparatus diagram: vessels, flows and dosing instructions on a single canvas,
     # so there is no separate recipe panel to cross-reference against the plumbing.
+    other_dose_volume_flow = _intermittent_dose_volume_flow_ml_min(drug_inputs, skip=setup_drug_name)
+    loading_volume_total = _loading_volume_total_ml(drug_inputs, skip=setup_drug_name)
     apparatus_fig = _plot_two_half_life_apparatus(_two_half_life_apparatus_view(
         system, fos, drug_inputs, result.summary, scenario, duration_h, recirculation_ml_min, target_system_half_life,
+        other_dose_volume_flow_ml_min=other_dose_volume_flow, loading_volume_ml=loading_volume_total,
     ))
     st.image(_figure_export_bytes(apparatus_fig, "png", dpi=300), width="stretch")
     st.caption(
@@ -484,8 +487,17 @@ def _page_two_half_life() -> None:
         "in µg/mL. The central compartment is magnetically stirred."
     )
     _render_schematic_export_buttons(st, apparatus_fig, "apparatus2", "hfim-apparatus-2-half-life")
+    st.info(_volume_balance_note(
+        system.q_waste_ml_min,
+        _setup_drug_dose_volume_flow_ml_min(fos) + other_dose_volume_flow,
+        loading_volume_total,
+        central_bottle_ml,
+    ))
     st.dataframe(
-        _setup_overview_rows(central_bottle_ml, cartridge_ml, extra_volume_ml, q_extra_to_central, q_extra_diluent, q_central_diluent, scenario, fos),
+        _setup_overview_rows(
+            central_bottle_ml, cartridge_ml, extra_volume_ml, q_extra_to_central, q_extra_diluent, q_central_diluent, scenario, fos,
+            other_dose_volume_flow_ml_min=other_dose_volume_flow, loading_volume_ml=loading_volume_total,
+        ),
         width="stretch",
         hide_index=True,
         column_config={
@@ -1143,6 +1155,78 @@ def _loading_target_default_mg_l(target_value: float, target_type: str, multipli
     return target_value * multiplier
 
 
+def _intermittent_dose_volume_flow_ml_min(drug_inputs: dict, skip: str | None = None) -> float:
+    """Average mL/min that intermittent central doses add (dose volume / dosing interval)."""
+    total = 0.0
+    for name, values in drug_inputs.items():
+        if name == skip or values.get("maintenance") != "intermittent infusion":
+            continue
+        volume = values.get("dose_volume_ml") or 0.0
+        interval_h = values.get("dosing_frequency_h") or 0.0
+        if volume > 0 and interval_h > 0:
+            total += volume / (interval_h * 60)
+    return total
+
+
+def _loading_volume_total_ml(drug_inputs: dict, skip: str | None = None) -> float:
+    """One-off volume that loading doses add to central at the start of the run."""
+    return sum(
+        values.get("loading_volume_ml") or 0.0
+        for name, values in drug_inputs.items()
+        if name != skip and values.get("loading_dose")
+    )
+
+
+def _setup_drug_dose_volume_flow_ml_min(fos: FosfomycinConfig | None) -> float:
+    """Average mL/min the setup drug's central syringe pumps add (main infusion plus slow line)."""
+    if fos is None:
+        return 0.0
+    flow = average_intermittent_rate(fos.central_infusion_ml_min, fos.infusion_duration_min, fos.dosing_interval_min)
+    if fos.has_slow_line:
+        flow += average_intermittent_rate(fos.slow_infusion_ml_min, fos.slow_duration_min, fos.dosing_interval_min)
+    return flow
+
+
+def _waste_pump_setting_ml_min(continuous_outflow_ml_min: float, dose_volume_flow_ml_min: float) -> float:
+    """Fixed waste pump rate that also removes the dose volumes, so central does not fill up.
+
+    Diluent and extra transfer run all the time; syringe doses only add volume while they run. A
+    waste pump set to just the continuous inflow would leave every dose volume in central. Adding the
+    dose volume averaged over its interval removes exactly that much per interval: central rises a few
+    mL during a dose and settles back before the next one.
+    """
+    return continuous_outflow_ml_min + dose_volume_flow_ml_min
+
+
+def _volume_balance_note(
+    continuous_outflow_ml_min: float,
+    dose_volume_flow_ml_min: float,
+    loading_volume_ml: float,
+    central_bottle_ml: float,
+) -> str:
+    waste = _waste_pump_setting_ml_min(continuous_outflow_ml_min, dose_volume_flow_ml_min)
+    parts = []
+    if dose_volume_flow_ml_min > 0:
+        parts.append(
+            f"Set the waste pump to **{waste:.3f} mL/min**, not {continuous_outflow_ml_min:.3f}. The syringe doses add "
+            f"{dose_volume_flow_ml_min * 1440:.1f} mL per day to central; {continuous_outflow_ml_min:.3f} only removes what the "
+            "diluent and transfer pumps bring in, so that volume would stay and build up, slowing washout for every drug. "
+            f"The extra {dose_volume_flow_ml_min:.4f} mL/min removes it: central rises a few mL during each dose and settles back."
+        )
+    else:
+        parts.append(f"Set the waste pump to **{waste:.3f} mL/min** (no recurring dose volume to remove).")
+    if loading_volume_ml > 0:
+        parts.append(
+            f"Loading doses add {loading_volume_ml:g} mL once, which the waste pump does not remove. Fill the central bottle "
+            f"with **{central_bottle_ml - loading_volume_ml:g} mL** instead of {central_bottle_ml:g} mL, so it reaches "
+            f"{central_bottle_ml:g} mL once the loading doses are in."
+        )
+    parts.append(
+        "Keep the waste outlet tube near the bottom of the central bottle, vent the bottle, and mark the starting level."
+    )
+    return " ".join(parts)
+
+
 def _setup_overview_rows(
     central_bottle_ml: float,
     cartridge_ml: float,
@@ -1152,6 +1236,8 @@ def _setup_overview_rows(
     q_central_diluent: float,
     scenario: str,
     fos: FosfomycinConfig,
+    other_dose_volume_flow_ml_min: float = 0.0,
+    loading_volume_ml: float = 0.0,
 ) -> list[dict]:
     central_volume = central_bottle_ml + cartridge_ml
     total_central_outflow = q_extra_to_central + q_central_diluent
@@ -1179,7 +1265,18 @@ def _setup_overview_rows(
         {"Part": "Extra volume", "Current value": f"{extra_volume_ml:g} mL", "How to use": extra_volume_use},
         {"Part": "Extra to central", "Current value": f"{q_extra_to_central:g} mL/min", "How to use": extra_transfer_use},
         {"Part": "Baseline waste", "Current value": f"{total_central_outflow:g} mL/min", "How to use": f"baseline central output from Qextra + central diluent; shared central half-life ≈ {_fmt_optional(central_half_life)} h"},
+        {
+            "Part": "Waste pump setting",
+            "Current value": f"{_waste_pump_setting_ml_min(total_central_outflow, _setup_drug_dose_volume_flow_ml_min(fos) + other_dose_volume_flow_ml_min):.4g} mL/min",
+            "How to use": "set the waste pump to this: baseline waste plus the syringe dose volumes averaged over their interval, so central does not fill up",
+        },
     ]
+    if loading_volume_ml > 0:
+        rows.append({
+            "Part": "Central bottle starting fill",
+            "Current value": f"{central_bottle_ml - loading_volume_ml:g} mL",
+            "How to use": f"loading doses add {loading_volume_ml:g} mL once; start this much lower so central is {central_bottle_ml:g} mL after loading",
+        })
     if scenario == "q24_replacement":
         rows.append({
             "Part": f"Extra q{fos.reservoir_replacement_interval_h:g}h replacement",
@@ -1907,8 +2004,13 @@ def _two_half_life_apparatus_view(
     duration_h: float,
     recirculation_ml_min: float,
     shared_half_life_h: float,
+    other_dose_volume_flow_ml_min: float = 0.0,
+    loading_volume_ml: float = 0.0,
 ) -> dict:
     interval_h = fos.dosing_interval_min / 60
+    waste_setting = _waste_pump_setting_ml_min(
+        system.q_waste_ml_min, _setup_drug_dose_volume_flow_ml_min(fos) + other_dose_volume_flow_ml_min
+    )
     dose_volume_ml = fos.central_infusion_ml_min * fos.infusion_duration_min
     setup_lines = [
         f"{fos.central_dose_mg:.3f} mg in {dose_volume_ml:g} mL",
@@ -1977,13 +2079,13 @@ def _two_half_life_apparatus_view(
             f"{shared_half_life_h:g} h   |   {duration_h:g} h run"
         ),
         "cartridge_volume": f"{system.cartridge_ml:g} mL",
-        "central_volume": f"{system.central_bottle_ml:g} mL",
+        "central_volume": _central_bottle_label(system.central_bottle_ml, loading_volume_ml),
         "extra_volume": f"{system.extra_volume_ml:g} mL",
-        "waste_total": f"{system.q_waste_ml_min * duration_h * 60:,.0f} mL",
+        "waste_total": f"{waste_setting * duration_h * 60:,.0f} mL",
         "central_diluent_total": f"{system.q_central_diluent_ml_min * duration_h * 60:,.0f} mL",
         "extra_diluent_total": f"{system.q_extra_diluent_ml_min * duration_h * 60:,.0f} mL",
         "recirculation": f"{recirculation_ml_min:g} mL/min",
-        "waste_flow": f"{system.q_waste_ml_min:.3f} mL/min",
+        "waste_flow": f"{waste_setting:.3f} mL/min",
         "extra_to_central_flow": f"{system.q_extra_to_central_ml_min:.3f} mL/min",
         "central_diluent_flow": f"{system.q_central_diluent_ml_min:.3f} mL/min",
         "extra_diluent_flow": f"{system.q_extra_diluent_ml_min:.3f} mL/min",
@@ -1991,6 +2093,12 @@ def _two_half_life_apparatus_view(
         "central_injection_groups": central_groups,
         "extra_injection_groups": extra_groups,
     }
+
+
+def _central_bottle_label(central_bottle_ml: float, loading_volume_ml: float) -> str:
+    if loading_volume_ml > 0:
+        return f"{central_bottle_ml:g} mL (start {central_bottle_ml - loading_volume_ml:g})"
+    return f"{central_bottle_ml:g} mL"
 
 
 def _one_half_life_apparatus_view(
@@ -2001,6 +2109,9 @@ def _one_half_life_apparatus_view(
     recirculation_ml_min: float,
     shared_half_life_h: float,
 ) -> dict:
+    waste_setting = _waste_pump_setting_ml_min(
+        system.q_central_diluent_ml_min, _intermittent_dose_volume_flow_ml_min(drug_inputs)
+    )
     return {
         "title": "HFIM apparatus - 1 half life (central only)",
         "subtitle": (
@@ -2008,11 +2119,11 @@ def _one_half_life_apparatus_view(
             f"({shared_half_life_h:g} h x 60) = {system.q_central_diluent_ml_min:.3f} mL/min   |   {duration_h:g} h run"
         ),
         "cartridge_volume": f"{system.cartridge_ml:g} mL",
-        "central_volume": f"{system.central_bottle_ml:g} mL",
-        "waste_total": f"{system.q_central_diluent_ml_min * duration_h * 60:,.0f} mL",
+        "central_volume": _central_bottle_label(system.central_bottle_ml, _loading_volume_total_ml(drug_inputs)),
+        "waste_total": f"{waste_setting * duration_h * 60:,.0f} mL",
         "central_diluent_total": f"{system.q_central_diluent_ml_min * duration_h * 60:,.0f} mL",
         "recirculation": f"{recirculation_ml_min:g} mL/min",
-        "waste_flow": f"{system.q_central_diluent_ml_min:.3f} mL/min",
+        "waste_flow": f"{waste_setting:.3f} mL/min",
         "central_diluent_flow": f"{system.q_central_diluent_ml_min:.3f} mL/min",
         "injection_groups": _central_drug_apparatus_groups(drug_inputs, summary),
     }
@@ -3378,6 +3489,12 @@ def _page_one_half_life() -> None:
         "in µg/mL. The central compartment is magnetically stirred."
     )
     _render_schematic_export_buttons(st, apparatus_fig, "apparatus1", "hfim-apparatus-1-half-life")
+    st.info(_volume_balance_note(
+        system.q_central_diluent_ml_min,
+        _intermittent_dose_volume_flow_ml_min(drug_inputs),
+        _loading_volume_total_ml(drug_inputs),
+        system.central_bottle_ml,
+    ))
 
     st.markdown("**System solution volumes**")
     st.dataframe(_solution_volume_rows(q_central, 0.0, "central_only", duration_h), width="stretch", hide_index=True)
